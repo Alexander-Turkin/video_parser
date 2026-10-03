@@ -1,0 +1,19 @@
+# Окружение
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+
+# Состояние раннера crun (логи, кэш спеков, worktree)
+.claude-runner/
+
+# Записи лекций, фрагменты, чанки и расшифровки — в git не храним
+/vidio_example
+/data/
+*.webm
+*.mp4
+*.mkv
+*.wav
+*.mp3
+*.m4a

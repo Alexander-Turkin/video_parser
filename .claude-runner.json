@@ -9,5 +9,11 @@
     "Bash(ffprobe *)"
   ],
   "extraDeny": [],
-  "extraDirs": ["/tmp/lecture-frames"]
+  "extraDirs": [
+    "/tmp/lecture-frames"
+  ],
+  "worktreeLink": [
+    ".venv",
+    "vidio_example"
+  ]
 }
