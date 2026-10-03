@@ -1,0 +1,1499 @@
+#!/usr/bin/env python3
+"""render_doc.py — сборка итогового markdown из саммари и предложений с таймкодами.
+
+На вход — файл схемы punctuated/1 (его пишет tools/punctuate.py: предложения с
+таймкодами, абзацы, окна пунктуации) и, необязательно, готовый markdown-фрагмент
+саммари от tools/summarize.py. На выход — один .md, в котором ровно два раздела:
+
+  ## Саммари      — фрагмент вставляется как есть, без переформатирования;
+  ## Расшифровка  — по строке на предложение, вида «[ЧЧ:ММ:СС] Текст.».
+
+Технического блока в документе нет сознательно: владелец решил, что модель, ×RT,
+SHA-256 входа, версии и длительность в итоговый файл не идут — они и так лежат в
+промежуточных JSON рядом с документом.
+
+Почему таймкоды форматируются своей функцией, а не format_timestamp() из
+tools/outputs.py: там формат SRT (HH:MM:SS,mmm с округлением до миллисекунд), а
+здесь нужен «ЧЧ:ММ:СС» с отбрасыванием дробной части — такая строка читается
+человеком и не притворяется точнее, чем есть. Файл outputs.py не правим: он занят
+рендером .txt и .srt.
+
+Почему строки предложений без двух пробелов на конце (жёсткий перенос markdown):
+критерий требует строку ровно вида «[ЧЧ:ММ:СС] текст», а невидимые пробелы в
+конце ломают и её, и обратный разбор файла построчно. Пометка об откате, наоборот,
+отделена от своего абзаца пустой строкой: без неё markdown по правилу ленивого
+продолжения затянул бы первую строку абзаца внутрь цитаты «>».
+
+Зависимостей нет: только стандартная библиотека. Ни claude, ни torch, ни ffmpeg
+здесь не нужны — инструмент только собирает текст из готовых файлов. Проверки
+живут в самом файле (--selftest): в окружении проекта нет pytest.
+
+Использование:
+  python tools/render_doc.py --punctuated <файл.json> --out <файл.md> [--summary <файл.md>]
+  python tools/render_doc.py --selftest
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass, field
+
+PROG = "render_doc.py"
+SCHEMA = "punctuated/1"
+
+# Заголовки разделов итогового документа. Больше в нём ничего нет.
+TITLE_SUMMARY = "## Саммари"
+TITLE_BODY = "## Расшифровка"
+
+# Заголовок, под который уходит пометка об отсутствующем саммари: тот же, что
+# первым разделом ставит tools/summarize.py, — чтобы документ выглядел одинаково
+# и с саммари, и без него.
+SUMMARY_FIRST_SECTION = "### Изложение"
+
+HELP = """Использование:
+  python tools/render_doc.py --punctuated <файл.json> --out <файл.md> [опции]
+  python tools/render_doc.py --selftest
+
+Собирает итоговый документ прогона: один markdown-файл с заголовком, разделом
+«## Саммари» (готовый фрагмент от tools/summarize.py вставляется как есть) и
+разделом «## Расшифровка», где каждое предложение — отдельная строка вида
+«[ЧЧ:ММ:СС] Текст предложения.». Абзацы разделены пустой строкой. Окна, в которых
+пунктуация не восстановилась, помечены видимой строкой перед своим блоком.
+Ничего, кроме этих двух разделов, в документе нет.
+
+Опции:
+  --punctuated <файл>   JSON схемы punctuated/1 от tools/punctuate.py (обязателен)
+  --out <файл>          куда записать итоговый .md (обязателен)
+  --summary <файл>      markdown-фрагмент саммари от tools/summarize.py;
+                        если не указан, не существует или пуст — вместо саммари
+                        в документ идёт пометка «не получено»
+  --title <строка>      заголовок документа; по умолчанию — имя исходной записи
+                        без расширения из поля source файла punctuated
+  --selftest            прогнать встроенные проверки и выйти
+  -h, --help            показать эту справку
+
+Каталог для --out создаётся при необходимости, файл пишется в UTF-8.
+
+Коды возврата:
+  0  документ записан, пометок в нём нет
+  1  документ записан, но в нём есть пометки (нет саммари или окна в откате)
+  2  вход непригоден (нет файла, не та схема, нет предложений) — --out не создаётся
+
+Примеры:
+  python tools/render_doc.py --punctuated data/output/лекция/punctuated.json \\
+      --summary data/output/лекция/summary.md --out "data/output/лекция-2026-10-03.md"
+  python tools/render_doc.py --punctuated p.json --out doc.md --title "Созвон команды"
+"""
+
+
+class UsageError(Exception):
+    """Ошибка в аргументах командной строки."""
+
+
+class DocumentError(Exception):
+    """Вход не читается, не той схемы или в нём нет нужных полей."""
+
+
+def die(message: str, code: int = 2) -> int:
+    """Печатает сообщение в stderr и отдаёт код возврата для main().
+
+    По умолчанию 2: все ошибки входа и аргументов означают «документ не собран»,
+    а код 1 в этом инструменте занят другим смыслом — документ записан, но с
+    пометками.
+    """
+    sys.stderr.write("%s: %s\n" % (PROG, message))
+    return code
+
+
+def warn(message: str) -> None:
+    """Предупреждение: работа продолжается, но пользователь должен знать."""
+    sys.stderr.write("%s: предупреждение: %s\n" % (PROG, message))
+
+
+# ----------------------------------------------------------------- таймкоды ---
+
+
+def format_timecode(seconds: float) -> str:
+    """Секунды от начала записи -> «ЧЧ:ММ:СС».
+
+    Дробная часть отбрасывается, а не округляется: таймкод в документе — это
+    метка «ищи здесь», и она не должна убегать вперёд от слова, с которого
+    предложение начинается. Часы, минуты и секунды всегда двузначные; запись
+    длиннее 100 часов даст три знака в часах, и это лучше, чем обрезанный час.
+    """
+    value = float(seconds)
+    if not math.isfinite(value):
+        raise ValueError("таймкод не является конечным числом: %r" % (seconds,))
+    if value < 0:
+        raise ValueError("таймкод не может быть отрицательным: %r" % (seconds,))
+    total = int(value)  # отбрасывание дробной части, а не округление
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return "%02d:%02d:%02d" % (hours, minutes, secs)
+
+
+# ------------------------------------------------------------ чтение входа ---
+
+
+@dataclass
+class Sentence:
+    """Предложение с таймкодами начала и конца в секундах от начала записи."""
+
+    index: int
+    start: float
+    end: float
+    text: str
+    window: int | None
+    fallback: bool
+
+
+@dataclass
+class Paragraph:
+    """Абзац: номер окна пунктуации и вошедшие в него предложения."""
+
+    index: int
+    window: int | None
+    sentences: list[Sentence] = field(default_factory=list)
+
+
+@dataclass
+class Window:
+    """Окно пунктуации: диапазон сегментов, итог сверки слов и причина отката."""
+
+    index: int
+    first_segment: int | None
+    last_segment: int | None
+    status: str
+    reason: str
+
+    @property
+    def fallback(self) -> bool:
+        return self.status == "fallback"
+
+
+@dataclass
+class Punctuated:
+    """То, что инструменту нужно от punctuated.json.
+
+    Остальные поля схемы (transcript, model, source_duration, text, stats) здесь
+    не нужны: в документ они не попадают по решению владельца, а привязываться к
+    ним ради отчёта значило бы ломаться от любой правки соседнего инструмента.
+    """
+
+    path: str
+    source: str
+    sentences: list[Sentence]
+    paragraphs: list[Paragraph]
+    windows: dict[int, Window]
+
+
+def _typename(value: object) -> str:
+    """Имя типа по-русски — для сообщений об ошибках."""
+    names = {
+        type(None): "null",
+        bool: "логическое значение",
+        int: "число",
+        float: "число",
+        str: "строка",
+        list: "список",
+        dict: "объект",
+    }
+    return names.get(type(value), type(value).__name__)
+
+
+def _as_number(holder: dict, key: str, where: str) -> float:
+    """Достаёт из словаря обязательное число, иначе — понятная ошибка."""
+    if key not in holder:
+        raise DocumentError("%s: нет обязательного поля %s" % (where, key))
+    value = holder[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DocumentError(
+            "%s: поле %s должно быть числом секунд, получено: %s"
+            % (where, key, _typename(value))
+        )
+    if not math.isfinite(float(value)):
+        raise DocumentError("%s: поле %s не является конечным числом" % (where, key))
+    return float(value)
+
+
+def _as_text(holder: dict, key: str, where: str) -> str:
+    """Достаёт из словаря обязательную строку, иначе — понятная ошибка."""
+    if key not in holder:
+        raise DocumentError("%s: нет обязательного поля %s" % (where, key))
+    value = holder[key]
+    if not isinstance(value, str):
+        raise DocumentError(
+            "%s: поле %s должно быть строкой, получено: %s"
+            % (where, key, _typename(value))
+        )
+    return value
+
+
+def _as_index(value: object) -> int | None:
+    """Целое без логических значений — или None, если это не номер."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _parse_windows(data: dict) -> dict[int, Window]:
+    """Разбирает список окон в отображение «номер окна -> окно».
+
+    Окна нужны ровно для одного: понять, где пунктуация не восстановилась, и
+    выписать перед таким блоком пометку с диапазоном сегментов и причиной.
+    Отсутствие списка фатальным не считается — тогда откаты определяются по
+    флагу fallback у самих предложений, но без диапазона сегментов.
+    """
+    raw_windows = data.get("windows")
+    if raw_windows is None:
+        warn("в файле нет списка windows — пометки об откате будут без номеров сегментов")
+        return {}
+    if not isinstance(raw_windows, list):
+        raise DocumentError(
+            "поле windows должно быть списком, получено: %s" % _typename(raw_windows)
+        )
+
+    windows: dict[int, Window] = {}
+    for position, raw in enumerate(raw_windows):
+        where = "окно №%d" % (position + 1)
+        if not isinstance(raw, dict):
+            raise DocumentError(
+                "%s должно быть объектом JSON, получено: %s" % (where, _typename(raw))
+            )
+        index = _as_index(raw.get("index"))
+        if index is None:
+            index = position
+
+        first_segment = last_segment = None
+        segments = raw.get("segments")
+        if isinstance(segments, list) and len(segments) == 2:
+            first_segment = _as_index(segments[0])
+            last_segment = _as_index(segments[1])
+
+        status = raw.get("status")
+        if not isinstance(status, str):
+            status = "ok"
+        reason = raw.get("reason")
+        if not isinstance(reason, str):
+            reason = ""
+
+        windows[index] = Window(
+            index=index,
+            first_segment=first_segment,
+            last_segment=last_segment,
+            status=status,
+            reason=reason.strip(),
+        )
+    return windows
+
+
+def _parse_sentences(data: dict) -> list[Sentence]:
+    """Разбирает предложения и упорядочивает их по полю index.
+
+    Порядок именно по index, а не по порядку в файле: index — это сквозная
+    нумерация из punctuate.py, и абзацы ссылаются на предложения по ней.
+    """
+    if "sentences" not in data:
+        raise DocumentError("в файле нет поля sentences")
+    raw_sentences = data["sentences"]
+    if not isinstance(raw_sentences, list):
+        raise DocumentError(
+            "поле sentences должно быть списком, получено: %s" % _typename(raw_sentences)
+        )
+    if not raw_sentences:
+        raise DocumentError("список sentences пуст — расшифровку собирать не из чего")
+
+    sentences: list[Sentence] = []
+    seen: set[int] = set()
+    for position, raw in enumerate(raw_sentences):
+        where = "предложение №%d" % (position + 1)
+        if not isinstance(raw, dict):
+            raise DocumentError(
+                "%s должно быть объектом JSON, получено: %s" % (where, _typename(raw))
+            )
+        index = _as_index(raw.get("index"))
+        if index is None:
+            index = position
+        else:
+            where = "предложение index=%d" % index
+        if index in seen:
+            raise DocumentError("%s: номер index повторяется" % where)
+        seen.add(index)
+
+        start = _as_number(raw, "start", where)
+        end = _as_number(raw, "end", where)
+        if start < 0:
+            raise DocumentError(
+                "%s: start меньше нуля (%s) — таймкод считается от начала записи"
+                % (where, start)
+            )
+        text = " ".join(_as_text(raw, "text", where).split())
+        if not text:
+            # Пустое предложение в документе дало бы строку из одного таймкода.
+            # Это не повод падать: ниже проверяется, что осталось хоть что-то.
+            warn("%s: пустой текст — предложение в документ не попадёт" % where)
+            continue
+
+        sentences.append(
+            Sentence(
+                index=index,
+                start=start,
+                end=max(start, end),
+                text=text,
+                window=_as_index(raw.get("window")),
+                fallback=bool(raw.get("fallback")),
+            )
+        )
+
+    if not sentences:
+        raise DocumentError("во всех предложениях пустой текст — писать нечего")
+    sentences.sort(key=lambda item: item.index)
+    return sentences
+
+
+def _parse_paragraphs(data: dict, sentences: list[Sentence]) -> list[Paragraph]:
+    """Собирает абзацы: каждый — диапазон [первый, последний] по index предложений.
+
+    Предложение, не попавшее ни в один абзац, не теряется: такие уходят в
+    дополнительный абзац в конце с предупреждением в stderr. Потерять строку
+    расшифровки из-за рассогласованного файла — хуже, чем отдать лишний абзац.
+    """
+    by_index = {sentence.index: sentence for sentence in sentences}
+
+    raw_paragraphs = data.get("paragraphs")
+    if raw_paragraphs is not None and not isinstance(raw_paragraphs, list):
+        raise DocumentError(
+            "поле paragraphs должно быть списком, получено: %s" % _typename(raw_paragraphs)
+        )
+    if not raw_paragraphs:
+        warn("в файле нет абзацев — вся расшифровка пойдёт одним абзацем")
+        return [
+            Paragraph(index=0, window=sentences[0].window, sentences=list(sentences))
+        ]
+
+    paragraphs: list[Paragraph] = []
+    used: set[int] = set()
+    for position, raw in enumerate(raw_paragraphs):
+        where = "абзац №%d" % (position + 1)
+        if not isinstance(raw, dict):
+            raise DocumentError(
+                "%s должен быть объектом JSON, получено: %s" % (where, _typename(raw))
+            )
+        index = _as_index(raw.get("index"))
+        if index is None:
+            index = position
+
+        bounds = raw.get("sentences")
+        if not isinstance(bounds, list) or len(bounds) != 2:
+            raise DocumentError(
+                "%s: поле sentences должно быть списком из двух номеров предложений"
+                % where
+            )
+        first = _as_index(bounds[0])
+        last = _as_index(bounds[1])
+        if first is None or last is None:
+            raise DocumentError("%s: границы абзаца должны быть целыми числами" % where)
+        if last < first:
+            raise DocumentError(
+                "%s: конец диапазона предложений раньше начала (%d и %d)"
+                % (where, first, last)
+            )
+
+        picked = [
+            by_index[number]
+            for number in range(first, last + 1)
+            if number in by_index and number not in used
+        ]
+        used.update(sentence.index for sentence in picked)
+        if not picked:
+            # Абзац без предложений (все пустые или уже израсходованы) —
+            # просто не попадает в документ, пустых блоков в нём нет.
+            continue
+        # Номер окна берётся у абзаца, а при его отсутствии — у первого
+        # предложения. Проверка именно на None: окно с номером 0 существует.
+        window = _as_index(raw.get("window"))
+        if window is None:
+            window = picked[0].window
+        paragraphs.append(Paragraph(index=index, window=window, sentences=picked))
+
+    paragraphs.sort(key=lambda item: item.index)
+
+    orphans = [sentence for sentence in sentences if sentence.index not in used]
+    if orphans:
+        warn(
+            "%d предложений не попали ни в один абзац — дописаны в конец расшифровки"
+            % len(orphans)
+        )
+        next_index = (paragraphs[-1].index + 1) if paragraphs else 0
+        paragraphs.append(
+            Paragraph(index=next_index, window=orphans[0].window, sentences=orphans)
+        )
+    return paragraphs
+
+
+def parse_punctuated(data: object, path: str = "<память>") -> Punctuated:
+    """Проверяет структуру JSON схемы punctuated/1 и приводит её к Punctuated.
+
+    Проверяется только то, без чего документ не собрать: схема, предложения с
+    текстом и таймкодами, согласованность абзацев. Качество самой пунктуации и
+    годность таймкодов — не дело этого инструмента.
+    """
+    if not isinstance(data, dict):
+        raise DocumentError(
+            "на верхнем уровне ожидается объект JSON, получено: %s" % _typename(data)
+        )
+
+    if "schema" not in data:
+        raise DocumentError("в файле нет поля schema (ожидается %r)" % SCHEMA)
+    if data["schema"] != SCHEMA:
+        raise DocumentError(
+            "не та схема: ожидается %r, в файле %r" % (SCHEMA, data["schema"])
+        )
+
+    source = data.get("source")
+    if not isinstance(source, str):
+        source = ""
+
+    sentences = _parse_sentences(data)
+    paragraphs = _parse_paragraphs(data, sentences)
+    windows = _parse_windows(data)
+    return Punctuated(
+        path=path,
+        source=source.strip(),
+        sentences=sentences,
+        paragraphs=paragraphs,
+        windows=windows,
+    )
+
+
+def load_punctuated(path: str) -> Punctuated:
+    """Читает punctuated.json. Любая беда на входе — DocumentError, не трейсбек."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        raise DocumentError("файл punctuated не найден: %s" % path) from None
+    except IsADirectoryError:
+        raise DocumentError("вместо файла punctuated указан каталог: %s" % path) from None
+    except PermissionError:
+        raise DocumentError("файл punctuated недоступен для чтения: %s" % path) from None
+    except UnicodeDecodeError:
+        raise DocumentError("файл punctuated не в кодировке UTF-8: %s" % path) from None
+    except json.JSONDecodeError as exc:
+        raise DocumentError(
+            "файл punctuated не разбирается как JSON: %s (строка %d, символ %d: %s)"
+            % (path, exc.lineno, exc.colno, exc.msg)
+        ) from None
+    except OSError as exc:
+        raise DocumentError(
+            "не удалось прочитать файл punctuated: %s (%s)" % (path, exc.strerror or exc)
+        ) from None
+    return parse_punctuated(data, path=path)
+
+
+def read_summary(path: str | None) -> tuple[str, str | None]:
+    """Читает фрагмент саммари. Возвращает (текст, что сказать в stderr).
+
+    Пустой текст означает «саммари нет»: решение о пометке в документе
+    принимается по нему, а второй элемент — только предупреждение для человека
+    и None, если говорить не о чем.
+
+    Фрагмент не переформатируется и не проверяется на внутреннюю структуру: его
+    пишет tools/summarize.py, и три раздела уровня «###» — его забота. Здесь
+    снимаются только пустые строки по краям, чтобы в документе не появилось
+    двух пустых строк подряд.
+
+    Нечитаемый фрагмент (нет прав, не UTF-8) приравнивается к отсутствующему:
+    расшифровку из-за него терять нельзя, а пометка в документе и код возврата 1
+    про проблему скажут.
+    """
+    if path is None:
+        return "", "файл с саммари не передан (--summary)"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        # Про отсутствующий файл в stderr не пишем: это ожидаемый исход прогона,
+        # в котором claude не ответил, и он уже виден по пометке и коду 1.
+        return "", None
+    except IsADirectoryError:
+        return "", "вместо файла саммари указан каталог: %s" % path
+    except PermissionError:
+        return "", "файл саммари недоступен для чтения: %s" % path
+    except UnicodeDecodeError:
+        return "", "файл саммари не в кодировке UTF-8: %s" % path
+    except OSError as exc:
+        return "", "не удалось прочитать файл саммари: %s (%s)" % (path, exc.strerror or exc)
+
+    text = raw.strip("\n").rstrip()
+    if not text.strip():
+        return "", None
+    return text, None
+
+
+# ----------------------------------------------------------------- рендер ---
+
+
+@dataclass
+class Stats:
+    """Чем закончилась сборка — это же уходит в отчёт и в код возврата."""
+
+    sentences: int = 0
+    paragraphs: int = 0
+    fallback_windows: list[int] = field(default_factory=list)
+    summary_missing: bool = False
+
+    @property
+    def marks(self) -> int:
+        """Сколько пометок видно в документе."""
+        return len(self.fallback_windows) + (1 if self.summary_missing else 0)
+
+
+def default_title(source: str, out: str) -> str:
+    """Заголовок по умолчанию — имя исходной записи без расширения.
+
+    Берётся из поля source файла punctuated: там лежит путь к записи, с которой
+    начинался прогон. Если его нет, остаётся имя самого документа — это хуже
+    (в нём уже есть дата прогона), но лучше пустого заголовка.
+    """
+    name = os.path.basename(source.rstrip("/\\")) if source else ""
+    if not name:
+        warn("в файле punctuated нет source — заголовок взят из имени --out")
+        name = os.path.basename(out)
+    title = os.path.splitext(name)[0].strip()
+    return title or "Расшифровка записи"
+
+
+def render_fallback_mark(window: Window | None, index: int | None) -> str:
+    """Строка-пометка перед блоком окна, где пунктуация не восстановилась.
+
+    Markdown-цитата «>» выбрана потому, что пометка обязана быть видна в
+    отрендеренном документе, а не прятаться в комментарии: читатель должен
+    понимать, что ниже идёт дословный текст модели без пунктуации.
+    """
+    number = window.index if window is not None else index
+    where = "окно %s" % ("—" if number is None else number)
+    if window is not None and window.first_segment is not None and window.last_segment is not None:
+        where += ", сегменты %d–%d" % (window.first_segment, window.last_segment)
+    else:
+        where += ", сегменты не указаны"
+    reason = (window.reason if window is not None else "") or "причина не указана"
+    reason = reason.rstrip().rstrip(".")  # точку ставит сам шаблон пометки
+    return (
+        "> ⚠️ Пунктуация не восстановлена (%s): %s. "
+        "Ниже — дословный текст модели." % (where, reason)
+    )
+
+
+def render_sentence(sentence: Sentence) -> str:
+    """Предложение -> строка «[ЧЧ:ММ:СС] текст»."""
+    return "[%s] %s" % (format_timecode(sentence.start), sentence.text)
+
+
+def _is_fallback(paragraph: Paragraph, windows: dict[int, Window]) -> bool:
+    """Нужна ли пометка перед этим абзацем.
+
+    Истина окна — поле status в windows. Флаг fallback у предложений работает
+    страховкой: если списка окон в файле нет, пометку всё равно надо поставить.
+    """
+    window = windows.get(paragraph.window) if paragraph.window is not None else None
+    if window is not None:
+        return window.fallback
+    return any(sentence.fallback for sentence in paragraph.sentences)
+
+
+def render_document(
+    data: Punctuated, title: str, summary: str, summary_path: str | None
+) -> tuple[str, Stats]:
+    """Собирает текст итогового документа и статистику по нему.
+
+    Документ — это список блоков, склеенных одной пустой строкой: заголовок,
+    «## Саммари», фрагмент саммари, «## Расшифровка» и дальше по два блока на
+    абзац (пометка, если окно в откате, и сами строки предложений).
+    """
+    stats = Stats()
+    blocks: list[str] = ["# %s" % title.strip(), TITLE_SUMMARY]
+
+    if summary.strip():
+        blocks.append(summary)
+    else:
+        stats.summary_missing = True
+        if summary_path is None:
+            missing = "Саммари не получено: файл с саммари не передан (--summary)."
+        else:
+            missing = (
+                "Саммари не получено: файл %s отсутствует или пуст." % summary_path
+            )
+        blocks.append("%s\n\n%s" % (SUMMARY_FIRST_SECTION, missing))
+
+    blocks.append(TITLE_BODY)
+
+    marked: set[int | None] = set()
+    for paragraph in data.paragraphs:
+        if not paragraph.sentences:
+            continue
+        if _is_fallback(paragraph, data.windows) and paragraph.window not in marked:
+            # Одно окно — одна пометка, даже если абзацев в нём несколько.
+            marked.add(paragraph.window)
+            window = (
+                data.windows.get(paragraph.window)
+                if paragraph.window is not None
+                else None
+            )
+            blocks.append(render_fallback_mark(window, paragraph.window))
+            stats.fallback_windows.append(
+                window.index if window is not None else (paragraph.window or 0)
+            )
+        blocks.append(
+            "\n".join(render_sentence(sentence) for sentence in paragraph.sentences)
+        )
+        stats.paragraphs += 1
+        stats.sentences += len(paragraph.sentences)
+
+    return "\n\n".join(blocks) + "\n", stats
+
+
+def write_text_file(path: str, content: str) -> None:
+    """Пишет файл в UTF-8 с переводами строк LF.
+
+    newline="\\n" задан явно: на Windows иначе получились бы CRLF, и «ровно одна
+    пустая строка между абзацами» перестала бы быть правдой.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+    except OSError as exc:
+        raise DocumentError(
+            "не удалось записать файл %s (%s)" % (path, exc.strerror or exc)
+        ) from None
+
+
+# ------------------------------------------------------------------- отчёт ---
+
+
+def print_report(path: str, size: int, stats: Stats) -> None:
+    """Печатает итоги сборки — то, что потом уходит в отчёт о прогоне."""
+    sys.stdout.write("================ ИТОГОВЫЙ ДОКУМЕНТ ================\n")
+    sys.stdout.write("Файл:          %s\n" % path)
+    sys.stdout.write("Размер:        %d байт\n" % size)
+    sys.stdout.write("Предложений:   %d\n" % stats.sentences)
+    sys.stdout.write("Абзацев:       %d\n" % stats.paragraphs)
+    sys.stdout.write("Пометок:       %d\n" % stats.marks)
+    if stats.summary_missing:
+        sys.stdout.write("  * саммари не получено\n")
+    if stats.fallback_windows:
+        sys.stdout.write(
+            "  * пунктуация не восстановлена в окнах: %s\n"
+            % ", ".join(str(number) for number in stats.fallback_windows)
+        )
+
+
+# --------------------------------------------------------- разбор аргументов ---
+
+_FLAGS_VALUE = {
+    "--punctuated": "punctuated",
+    "--summary": "summary",
+    "--out": "out",
+    "--title": "title",
+}
+
+
+def parse_args(argv: list[str]) -> dict:
+    """Разбирает аргументы так же, как это делают остальные инструменты проекта.
+
+    Своим разбором, а не argparse: тот печатает usage и свои ошибки по-английски,
+    а весь остальной вывод инструментов проекта — на русском.
+    """
+    opts: dict = {
+        "punctuated": None,
+        "summary": None,
+        "out": None,
+        "title": None,
+        "help": False,
+        "selftest": False,
+    }
+
+    position = 0
+    while position < len(argv):
+        token = argv[position]
+        inline: str | None = None
+        if token.startswith("--") and "=" in token:
+            token, _, inline = token.partition("=")
+
+        if token in ("-h", "--help", "--selftest"):
+            if inline is not None:
+                raise UsageError("%s не принимает значение" % token)
+            opts["help" if token != "--selftest" else "selftest"] = True
+            position += 1
+            continue
+
+        if token in _FLAGS_VALUE:
+            if inline is None:
+                if position + 1 >= len(argv):
+                    raise UsageError("%s требует значение" % token)
+                value = argv[position + 1]
+                position += 2
+            else:
+                value = inline
+                position += 1
+            # --title принимает любую строку, остальные флаги — путь; пустое
+            # значение в обоих случаях бессмысленно. У заголовка пустым считается
+            # и текст из одних пробелов: в документ он уйдёт обрезанным.
+            empty = not value.strip() if token == "--title" else not value
+            if empty:
+                raise UsageError("%s требует непустое значение" % token)
+            opts[_FLAGS_VALUE[token]] = value
+            continue
+
+        if token.startswith("-"):
+            raise UsageError("неизвестная опция: %s (см. --help)" % token)
+        raise UsageError("лишний аргумент: %s (см. --help)" % token)
+
+    return opts
+
+
+def check_args(opts: dict) -> None:
+    """Проверяет набор аргументов целиком — то, что нельзя проверить по одному."""
+    if not opts["punctuated"]:
+        raise UsageError("не указан --punctuated (см. --help)")
+    if not opts["out"]:
+        raise UsageError("не указан --out (см. --help)")
+
+    out = os.path.abspath(opts["out"])
+    # Перетереть собственный вход — это потерять прогон целиком, а переписать
+    # заново punctuated.json нечем: он стоит двух часов распознавания.
+    if out == os.path.abspath(opts["punctuated"]):
+        raise UsageError("--out указывает на тот же файл, что и --punctuated: %s" % opts["out"])
+    if opts["summary"] and out == os.path.abspath(opts["summary"]):
+        raise UsageError("--out указывает на тот же файл, что и --summary: %s" % opts["out"])
+
+
+# ---------------------------------------------------------------- селф-тест ---
+
+# Строка предложения: таймкод в квадратных скобках, пробел, непустой текст.
+# Часы не ограничены двумя знаками сверху, но меньше двух быть не может.
+SENTENCE_RE = re.compile(r"^\[(\d{2,}):([0-5]\d):([0-5]\d)\] (\S.*)$")
+
+# Пометка об откате — ровно того вида, который требуют критерии приёмки.
+MARK_RE = re.compile(
+    r"^> ⚠️ Пунктуация не восстановлена \((?P<where>[^()]+)\): (?P<reason>.+)\. "
+    r"Ниже — дословный текст модели\.$"
+)
+
+# Слова технического блока: ни одного из них в документе быть не должно.
+TECH_WORDS = ("×RT", "SHA-256", "sha256", "source_duration", "v3_rnnt", "torch")
+
+
+def _check(condition: object, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+@dataclass
+class ParsedDoc:
+    """Результат обратного разбора документа простым проходом по строкам."""
+
+    title: str
+    summary: list[str]
+    marks: list[str]
+    paragraphs: list[list[tuple[int, str]]]  # (секунды, текст) по строкам абзаца
+
+
+def parse_document(text: str) -> ParsedDoc:
+    """Разбирает собственный документ построчно. Отступление от формата — AssertionError.
+
+    Это и проверка структуры, и демонстрация того, что документ читается без
+    markdown-парсера: сборочному скрипту и человеку хватает split("\\n").
+    """
+    _check(text, "документ пуст")
+    _check(text.endswith("\n"), "документ не заканчивается переводом строки")
+    _check("\r" not in text, "в документе есть возврат каретки")
+    _check("\n\n\n" not in text, "в документе больше одной пустой строки подряд")
+
+    lines = text.rstrip("\n").split("\n")
+    _check(lines[0].startswith("# "), "первая строка не заголовок первого уровня: %r" % lines[0])
+    title = lines[0][2:]
+    _check(title.strip() == title and title, "заголовок пуст или с пробелами по краям: %r" % title)
+    _check(len(lines) > 1 and lines[1] == "", "после заголовка нет пустой строки")
+
+    _check(lines[2] == TITLE_SUMMARY, "третья строка не %r, а %r" % (TITLE_SUMMARY, lines[2]))
+    _check(TITLE_BODY in lines, "в документе нет раздела %r" % TITLE_BODY)
+    body_at = lines.index(TITLE_BODY)
+    summary = [line for line in lines[3:body_at] if line != ""] or []
+
+    headings = [line for line in lines if line.startswith("# ") or line.startswith("## ")]
+    _check(
+        headings == [lines[0], TITLE_SUMMARY, TITLE_BODY],
+        "в документе есть лишние заголовки: %r" % headings,
+    )
+
+    marks: list[str] = []
+    paragraphs: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    for line in lines[body_at + 1:]:
+        if line == "":
+            if current:
+                paragraphs.append(current)
+                current = []
+            continue
+        if line.startswith(">"):
+            _check(not current, "пометка внутри абзаца, а не перед ним: %r" % line)
+            _check(MARK_RE.match(line) is not None, "пометка не того вида: %r" % line)
+            marks.append(line)
+            continue
+        match = SENTENCE_RE.match(line)
+        _check(match is not None, "строка расшифровки не того вида: %r" % line)
+        _check(line == line.rstrip(), "в конце строки расшифровки есть пробелы: %r" % line)
+        hours, minutes, seconds = (int(match.group(number)) for number in (1, 2, 3))
+        current.append((hours * 3600 + minutes * 60 + seconds, match.group(4)))
+    if current:
+        paragraphs.append(current)
+
+    _check(paragraphs, "в разделе расшифровки нет ни одного абзаца")
+    return ParsedDoc(title=title, summary=summary, marks=marks, paragraphs=paragraphs)
+
+
+def _fixture_summary() -> str:
+    """Фрагмент саммари — такой, какой пишет tools/summarize.py: три раздела «###»."""
+    return (
+        "### Изложение\n"
+        "\n"
+        "Обсудили сборку итогового документа и порядок разделов в нём.\n"
+        "\n"
+        "Договорились, что технический блок в документ не идёт.\n"
+        "\n"
+        "### Темы\n"
+        "\n"
+        "- [00:00:00] Вступление и план созвона\n"
+        "- [01:02:03] Формат итогового markdown\n"
+        "\n"
+        "### Решения, задачи, договорённости\n"
+        "\n"
+        "- [01:02:03] Таймкод на каждое предложение\n"
+    )
+
+
+def _fixture_punctuated(*, fallback: bool = False) -> dict:
+    """Файл схемы punctuated/1 для проверок: собирается в памяти, без claude.
+
+    Два окна и три абзаца. Второе окно начинается на 3723-й секунде — это ровно
+    01:02:03, то есть случай «таймкод больше часа» из критериев приёмки. При
+    fallback=True второе окно объявлено откатившимся: в нём одна строка на
+    сегмент, дословный текст модели без пунктуации.
+    """
+    sentences = [
+        {"index": 0, "start": 0.0, "end": 4.25, "text": "Добрый день, начинаем созвон.", "window": 0, "fallback": False},
+        {"index": 1, "start": 4.25, "end": 9.5, "text": "Сегодня разбираем формат итогового файла.", "window": 0, "fallback": False},
+        {"index": 2, "start": 9.5, "end": 15.125, "text": "Первый вопрос — заголовок документа.", "window": 0, "fallback": False},
+        {"index": 3, "start": 59.999, "end": 64.0, "text": "Второй абзац того же окна.", "window": 0, "fallback": False},
+        {"index": 4, "start": 3723.9, "end": 3730.0, "text": "Через час вернулись к таймкодам.", "window": 1, "fallback": fallback},
+        {"index": 5, "start": 3730.0, "end": 3736.5, "text": "На этом закончили.", "window": 1, "fallback": fallback},
+    ]
+    if fallback:
+        # В откатившемся окне предложения — это сегменты: строчными, без точек.
+        sentences[4]["text"] = "через час вернулись к таймкодам"
+        sentences[5]["text"] = "на этом закончили"
+
+    windows = [
+        {"index": 0, "segments": [0, 99], "status": "ok", "reason": ""},
+        {
+            "index": 1,
+            "segments": [100, 142],
+            "status": "fallback" if fallback else "ok",
+            "reason": "слова не совпали с транскриптом (позиция 17: «созвон» → «разговор»)"
+            if fallback
+            else "",
+        },
+    ]
+    return {
+        "schema": SCHEMA,
+        "source": "data/output/созвон команды/созвон команды.webm",
+        "source_duration": 3740.0,
+        "transcript": "data/output/созвон команды/transcript.json",
+        "model": "v3_rnnt",
+        "windows": windows,
+        "paragraphs": [
+            {"index": 0, "window": 0, "sentences": [0, 2]},
+            {"index": 1, "window": 0, "sentences": [3, 3]},
+            {"index": 2, "window": 1, "sentences": [4, 5]},
+        ],
+        "sentences": sentences,
+        "text": "\n\n".join(
+            [
+                " ".join(item["text"] for item in sentences[0:3]),
+                sentences[3]["text"],
+                " ".join(item["text"] for item in sentences[4:6]),
+            ]
+        ),
+        "stats": {
+            "windows": 2,
+            "fallback_windows": 1 if fallback else 0,
+            "paragraphs": 3,
+            "sentences": len(sentences),
+            "words": sum(len(item["text"].split()) for item in sentences),
+        },
+    }
+
+
+def _write_json(path: str, payload: object) -> str:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    return path
+
+
+def _run(argv: list[str]) -> tuple[int, str, str]:
+    """Сквозной прогон main() с перехватом вывода."""
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        code = main(argv)
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _test_timecodes() -> None:
+    """Формат таймкода: двузначные части, отбрасывание дробей, больше часа."""
+    cases = [
+        (0.0, "00:00:00"),
+        (0.999, "00:00:00"),
+        (9.5, "00:00:09"),
+        (59.999, "00:00:59"),  # округления нет: 59.999 это ещё 59-я секунда
+        (60.0, "00:01:00"),
+        (3599.0, "00:59:59"),
+        (3600.0, "01:00:00"),
+        (3723.0, "01:02:03"),
+        (3723.9, "01:02:03"),
+        (9323.0, "02:35:23"),
+    ]
+    for seconds, expected in cases:
+        got = format_timecode(seconds)
+        _check(got == expected, "%s -> %s, ожидалось %s" % (seconds, got, expected))
+        _check(
+            re.fullmatch(r"\d{2,}:\d{2}:\d{2}", got) is not None,
+            "таймкод не в формате ЧЧ:ММ:СС: %s" % got,
+        )
+    # Больше 99 часов: часы растут, а не обрезаются.
+    _check(format_timecode(360_000.0) == "100:00:00", "100 часов -> %s" % format_timecode(360_000.0))
+    for bad in (-0.001, float("nan"), float("inf")):
+        try:
+            format_timecode(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("формат принял недопустимое значение %r" % bad)
+
+
+def _test_plain_document() -> None:
+    """Обычный документ: структура, порядок предложений, саммари как есть."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
+        summary = os.path.join(workdir, "summary.md")
+        write_text_file(summary, _fixture_summary())
+        # Кириллица и пробелы в пути и каталог, которого ещё нет.
+        out = os.path.join(workdir, "итог прогона", "созвон команды-2026-10-03.md")
+
+        code, report, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out]
+        )
+        _check(code == 0, "обычный документ вернул код %d (stderr: %s)" % (code, stderr.strip()))
+        _check(os.path.isfile(out), "документ не записан: %s" % out)
+
+        with open(out, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        doc = parse_document(text)
+
+        _check(doc.title == "созвон команды", "заголовок по умолчанию: %r" % doc.title)
+        _check(not doc.marks, "в чистом документе появились пометки: %r" % doc.marks)
+        _check(len(doc.paragraphs) == 3, "абзацев %d, а в файле 3" % len(doc.paragraphs))
+
+        # Фрагмент саммари вставлен как есть: все его непустые строки на месте и
+        # в том же порядке.
+        expected_summary = [line for line in _fixture_summary().split("\n") if line != ""]
+        _check(doc.summary == expected_summary, "фрагмент саммари переформатирован: %r" % doc.summary)
+
+        # Порядок предложений — по index, таймкоды не убывают, текст не переписан.
+        fixture = _fixture_punctuated()["sentences"]
+        flat = [line for paragraph in doc.paragraphs for line in paragraph]
+        _check(len(flat) == len(fixture), "строк %d, а предложений %d" % (len(flat), len(fixture)))
+        previous = -1
+        for (seconds, body), sentence in zip(flat, fixture):
+            _check(body == sentence["text"], "текст предложения изменился: %r" % body)
+            _check(seconds == int(sentence["start"]), "таймкод %d при start %s" % (seconds, sentence["start"]))
+            _check(seconds >= previous, "таймкоды пошли вспять на %r" % body)
+            previous = seconds
+        _check("[01:02:03]" in text, "таймкод больше часа не отрендерился как 01:02:03")
+
+        # Технического блока в документе нет.
+        for word in TECH_WORDS:
+            _check(word not in text, "в документе есть техническая деталь: %s" % word)
+
+        # Отчёт в stdout — на русском и со всеми числами.
+        for needle in ("Файл:", "Размер:", "Предложений:   6", "Абзацев:       3", "Пометок:       0"):
+            _check(needle in report, "в отчёте нет строки %r" % needle)
+        _check(out in report, "в отчёте нет пути к документу")
+        _check(str(os.path.getsize(out)) in report, "в отчёте нет размера файла")
+
+        # Заголовок можно задать руками — с пробелами и кириллицей.
+        out2 = os.path.join(workdir, "второй.md")
+        code, _, _ = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out2,
+             "--title", "Созвон команды, 3 октября"]
+        )
+        _check(code == 0, "прогон с --title вернул код %d" % code)
+        with open(out2, "r", encoding="utf-8") as handle:
+            _check(
+                parse_document(handle.read()).title == "Созвон команды, 3 октября",
+                "--title не попал в заголовок",
+            )
+
+
+def _test_fallback_document() -> None:
+    """Документ с окном в откате: пометка перед блоком, код возврата 1."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(
+            os.path.join(workdir, "punctuated.json"), _fixture_punctuated(fallback=True)
+        )
+        summary = os.path.join(workdir, "summary.md")
+        write_text_file(summary, _fixture_summary())
+        out = os.path.join(workdir, "doc.md")
+
+        code, report, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out]
+        )
+        _check(code == 1, "документ с откатом вернул код %d, ожидался 1" % code)
+
+        with open(out, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        doc = parse_document(text)
+        _check(len(doc.marks) == 1, "пометок %d, а окно в откате одно" % len(doc.marks))
+        mark = doc.marks[0]
+        match = MARK_RE.match(mark)
+        _check(match.group("where") == "окно 1, сегменты 100–142", "в пометке не тот диапазон: %r" % mark)
+        _check("созвон" in match.group("reason"), "в пометке нет причины отката: %r" % mark)
+
+        # Пометка стоит перед своим блоком и отделена от него пустой строкой:
+        # иначе markdown затянул бы первую строку абзаца внутрь цитаты.
+        lines = text.rstrip("\n").split("\n")
+        at = lines.index(mark)
+        _check(lines[at - 1] == "", "перед пометкой нет пустой строки")
+        _check(lines[at + 1] == "", "после пометки нет пустой строки")
+        _check(lines[at + 2].startswith("[01:02:03] "), "после пометки не блок её окна: %r" % lines[at + 2])
+        # Текст отката идёт дословно, без пунктуации — его не «починили».
+        _check(lines[at + 2] == "[01:02:03] через час вернулись к таймкодам", "текст отката изменён")
+
+        # Предложения чистого окна остались выше пометки и не помечены.
+        _check(at > lines.index(TITLE_BODY), "пометка оказалась выше раздела расшифровки")
+        _check(len(doc.paragraphs) == 3, "абзацев %d, а в файле 3" % len(doc.paragraphs))
+
+        for needle in ("Пометок:       1", "окнах: 1"):
+            _check(needle in report, "в отчёте нет строки %r" % needle)
+        _check(not stderr.strip(), "при корректном входе есть вывод в stderr: %s" % stderr.strip())
+
+        # Несколько абзацев в одном откатившемся окне дают ровно одну пометку.
+        payload = _fixture_punctuated(fallback=True)
+        payload["paragraphs"][2] = {"index": 2, "window": 1, "sentences": [4, 4]}
+        payload["paragraphs"].append({"index": 3, "window": 1, "sentences": [5, 5]})
+        many = _write_json(os.path.join(workdir, "many.json"), payload)
+        out2 = os.path.join(workdir, "many.md")
+        code, _, _ = _run(["--punctuated", many, "--summary", summary, "--out", out2])
+        _check(code == 1, "второй прогон с откатом вернул код %d" % code)
+        with open(out2, "r", encoding="utf-8") as handle:
+            doc2 = parse_document(handle.read())
+        _check(len(doc2.marks) == 1, "на два абзаца одного окна выдано %d пометок" % len(doc2.marks))
+        _check(len(doc2.paragraphs) == 4, "абзацев %d, а в файле 4" % len(doc2.paragraphs))
+
+
+def _test_missing_summary() -> None:
+    """Саммари нет: расшифровка сохраняется, под «## Саммари» — пометка, код 1."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
+        empty = os.path.join(workdir, "пусто.md")
+        write_text_file(empty, "\n   \n\n")
+        absent = os.path.join(workdir, "нет саммари.md")
+
+        cases = [
+            ("файла нет", ["--summary", absent], absent),
+            ("файл пуст", ["--summary", empty], empty),
+            ("флаг не передан", [], None),
+        ]
+        for name, extra, path in cases:
+            out = os.path.join(workdir, "out-%d.md" % len(name))
+            code, report, stderr = _run(["--punctuated", punctuated, "--out", out] + extra)
+            _check(code == 1, "случай %r вернул код %d, ожидался 1" % (name, code))
+
+            with open(out, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            doc = parse_document(text)
+            _check(
+                doc.summary[0] == SUMMARY_FIRST_SECTION,
+                "случай %r: под «## Саммари» нет %r (%r)" % (name, SUMMARY_FIRST_SECTION, doc.summary[:1]),
+            )
+            note = doc.summary[1]
+            _check(
+                note.startswith("Саммари не получено:"),
+                "случай %r: нет пометки об отсутствии саммари (%r)" % (name, note),
+            )
+            if path is not None:
+                _check(
+                    note == "Саммари не получено: файл %s отсутствует или пуст." % path,
+                    "случай %r: пометка не того вида: %r" % (name, note),
+                )
+                _check(path in note, "случай %r: в пометке нет пути к файлу" % name)
+            # Расшифровка на месте и целиком.
+            _check(
+                sum(len(paragraph) for paragraph in doc.paragraphs) == 6,
+                "случай %r: расшифровка потерялась" % name,
+            )
+            _check(not doc.marks, "случай %r: появилась пометка об откате" % name)
+            _check("Пометок:       1" in report, "случай %r: в отчёте не та цифра пометок" % name)
+            _check("саммари не получено" in report, "случай %r: в отчёте нет причины пометки" % name)
+
+        # Нет ни саммари, ни пунктуации — две пометки, код всё равно 1.
+        both = _write_json(os.path.join(workdir, "both.json"), _fixture_punctuated(fallback=True))
+        out = os.path.join(workdir, "both.md")
+        code, report, _ = _run(["--punctuated", both, "--out", out])
+        _check(code == 1, "документ с двумя пометками вернул код %d" % code)
+        _check("Пометок:       2" in report, "в отчёте не две пометки: %s" % report)
+
+        # Каталог вместо файла саммари — тот же результат, что и «файла нет».
+        code, _, stderr = _run(
+            ["--punctuated", punctuated, "--summary", workdir, "--out", os.path.join(workdir, "dir.md")]
+        )
+        _check(code == 1, "каталог вместо саммари вернул код %d" % code)
+        _check(stderr.strip() != "", "про каталог вместо саммари ничего не сказано")
+
+
+def _test_broken_input() -> None:
+    """Непригодный вход: код 2, понятное сообщение, файл --out не создаётся."""
+    cases = [
+        ("не объект", []),
+        ("нет schema", {"sentences": []}),
+        ("чужая схема", {"schema": "punctuated/2", "sentences": []}),
+        ("схема транскрипта", {"schema": "transcript/1", "sentences": []}),
+        ("нет sentences", {"schema": SCHEMA, "paragraphs": []}),
+        ("sentences не список", {"schema": SCHEMA, "sentences": {}}),
+        ("sentences пуст", {"schema": SCHEMA, "sentences": []}),
+        (
+            "все предложения пустые",
+            {"schema": SCHEMA, "sentences": [{"index": 0, "start": 0.0, "end": 1.0, "text": "   "}]},
+        ),
+        (
+            "нет start",
+            {"schema": SCHEMA, "sentences": [{"index": 0, "end": 1.0, "text": "а"}]},
+        ),
+        (
+            "start не число",
+            {"schema": SCHEMA, "sentences": [{"index": 0, "start": "ноль", "end": 1.0, "text": "а"}]},
+        ),
+        (
+            "start меньше нуля",
+            {"schema": SCHEMA, "sentences": [{"index": 0, "start": -1.0, "end": 1.0, "text": "а"}]},
+        ),
+        (
+            "нет text",
+            {"schema": SCHEMA, "sentences": [{"index": 0, "start": 0.0, "end": 1.0}]},
+        ),
+        (
+            "index повторяется",
+            {
+                "schema": SCHEMA,
+                "sentences": [
+                    {"index": 0, "start": 0.0, "end": 1.0, "text": "а"},
+                    {"index": 0, "start": 1.0, "end": 2.0, "text": "б"},
+                ],
+            },
+        ),
+        (
+            "границы абзаца перевёрнуты",
+            {
+                "schema": SCHEMA,
+                "sentences": [{"index": 0, "start": 0.0, "end": 1.0, "text": "а"}],
+                "paragraphs": [{"index": 0, "window": 0, "sentences": [1, 0]}],
+            },
+        ),
+        (
+            "абзац без границ",
+            {
+                "schema": SCHEMA,
+                "sentences": [{"index": 0, "start": 0.0, "end": 1.0, "text": "а"}],
+                "paragraphs": [{"index": 0, "window": 0}],
+            },
+        ),
+        (
+            "windows не список",
+            {
+                "schema": SCHEMA,
+                "sentences": [{"index": 0, "start": 0.0, "end": 1.0, "text": "а"}],
+                "windows": 5,
+            },
+        ),
+    ]
+    for name, payload in cases:
+        try:
+            # Предупреждения разбора глушатся: часть случаев по пути к ошибке
+            # успевает пожаловаться на абзацы, и в выводе селф-теста это мусор.
+            with redirect_stderr(io.StringIO()):
+                parse_punctuated(payload)
+        except DocumentError as exc:
+            _check(str(exc).strip() != "", "случай %r: пустое сообщение об ошибке" % name)
+        else:
+            raise AssertionError("случай %r прошёл проверку структуры" % name)
+
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        good = _write_json(os.path.join(workdir, "good.json"), _fixture_punctuated())
+        empty_sentences = _write_json(
+            os.path.join(workdir, "empty.json"),
+            dict(_fixture_punctuated(), sentences=[], paragraphs=[], stats={}),
+        )
+        broken = os.path.join(workdir, "broken.json")
+        write_text_file(broken, '{"schema": "punctuated/1", "sentences": [')
+        out = os.path.join(workdir, "не должен появиться", "doc.md")
+
+        for argv, what in (
+            (["--punctuated", empty_sentences, "--out", out], "пустой список предложений"),
+            (["--punctuated", broken, "--out", out], "битый JSON"),
+            (["--punctuated", os.path.join(workdir, "нет.json"), "--out", out], "нет файла"),
+            (["--punctuated", workdir, "--out", out], "каталог вместо файла"),
+            (["--out", out], "без --punctuated"),
+            (["--punctuated", good], "без --out"),
+            (["--punctuated", good, "--out", good], "--out поверх входа"),
+            (["--punctuated", good, "--out", out, "--title", "  "], "пустой --title"),
+            (["--punctuated", good, "--out"], "--out без значения"),
+            (["--кривая-опция"], "неизвестная опция"),
+            (["лишнее"], "лишний аргумент"),
+            (["--selftest=1"], "--selftest со значением"),
+        ):
+            code, _, stderr = _run(argv)
+            _check(code == 2, "случай %r завершился кодом %d, ожидался 2" % (what, code))
+            _check(
+                stderr.startswith(PROG + ":"),
+                "случай %r ничего не написал в stderr" % what,
+            )
+            _check(
+                not os.path.exists(out),
+                "случай %r оставил файл --out на диске" % what,
+            )
+
+        # Существующий документ при непригодном входе не перетирается.
+        kept = os.path.join(workdir, "kept.md")
+        write_text_file(kept, "старое содержимое\n")
+        code, _, _ = _run(["--punctuated", broken, "--out", kept])
+        _check(code == 2, "перетирание: код %d вместо 2" % code)
+        with open(kept, "r", encoding="utf-8") as handle:
+            _check(handle.read() == "старое содержимое\n", "старый документ перетёрт при ошибке входа")
+
+
+def _test_degraded_input() -> None:
+    """Входу чего-то не хватает, но расшифровку можно собрать — собираем."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        # Нет абзацев и нет окон: вся расшифровка одним абзацем, пометок нет.
+        payload = _fixture_punctuated()
+        payload.pop("paragraphs")
+        payload.pop("windows")
+        path = _write_json(os.path.join(workdir, "flat.json"), payload)
+        out = os.path.join(workdir, "flat.md")
+        code, _, stderr = _run(["--punctuated", path, "--out", out, "--title", "Без абзацев"])
+        _check(code == 1, "документ без саммари вернул код %d" % code)  # саммари не передано
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(len(doc.paragraphs) == 1, "абзацев %d вместо одного" % len(doc.paragraphs))
+        _check(len(doc.paragraphs[0]) == 6, "строк в единственном абзаце %d" % len(doc.paragraphs[0]))
+        _check("абзац" in stderr, "про отсутствие абзацев не предупредили: %s" % stderr)
+
+        # Нет source — заголовок берётся из имени --out.
+        payload = _fixture_punctuated()
+        payload["source"] = ""
+        path = _write_json(os.path.join(workdir, "nosource.json"), payload)
+        out = os.path.join(workdir, "запись без source.md")
+        code, _, stderr = _run(["--punctuated", path, "--out", out])
+        _check(code == 1, "прогон без source вернул код %d" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            _check(
+                parse_document(handle.read()).title == "запись без source",
+                "заголовок не взят из имени --out",
+            )
+        _check("source" in stderr, "про отсутствие source не предупредили")
+
+        # Окон нет, но предложения помечены fallback — пометка всё равно есть,
+        # просто без диапазона сегментов.
+        payload = _fixture_punctuated(fallback=True)
+        payload.pop("windows")
+        path = _write_json(os.path.join(workdir, "noweindows.json"), payload)
+        out = os.path.join(workdir, "nowindows.md")
+        code, report, _ = _run(["--punctuated", path, "--out", out])
+        _check(code == 1, "прогон без windows вернул код %d" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(len(doc.marks) == 1, "пометок %d вместо одной" % len(doc.marks))
+        _check("сегменты не указаны" in doc.marks[0], "пометка без windows не того вида: %r" % doc.marks[0])
+        _check("Пометок:       2" in report, "в отчёте не две пометки")
+
+        # Предложение, не попавшее ни в один абзац, не теряется.
+        payload = _fixture_punctuated()
+        payload["paragraphs"] = [{"index": 0, "window": 0, "sentences": [0, 2]}]
+        path = _write_json(os.path.join(workdir, "orphans.json"), payload)
+        out = os.path.join(workdir, "orphans.md")
+        code, _, stderr = _run(["--punctuated", path, "--out", out])
+        _check(code == 1, "прогон с потерянными предложениями вернул код %d" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(
+            sum(len(paragraph) for paragraph in doc.paragraphs) == 6,
+            "потерялись предложения вне абзацев",
+        )
+        _check("не попали ни в один абзац" in stderr, "про предложения вне абзацев не предупредили")
+
+        # Окно с номером 0 в откате. Номер абзаца «0» — это номер, а не «номера
+        # нет»: чтобы ветки нельзя было перепутать, у предложений этих абзацев
+        # номер окна проставлен другой, и пометку обязан дать абзац.
+        payload = _fixture_punctuated()
+        payload["windows"][0]["status"] = "fallback"
+        payload["windows"][0]["reason"] = "claude недоступен"
+        for item in payload["sentences"][:4]:
+            item["window"] = 1
+        path = _write_json(os.path.join(workdir, "window0.json"), payload)
+        out = os.path.join(workdir, "window0.md")
+        code, _, _ = _run(["--punctuated", path, "--out", out])
+        _check(code == 1, "прогон с откатом окна 0 вернул код %d" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(len(doc.marks) == 1, "пометок %d вместо одной" % len(doc.marks))
+        _check(
+            "окно 0, сегменты 0–99" in doc.marks[0],
+            "окно 0 не распознано как окно: %r" % doc.marks[0],
+        )
+        _check(
+            doc.paragraphs[0][0][1].startswith("Добрый день"),
+            "пометка встала не перед первым абзацем окна 0",
+        )
+
+        # А когда поля window у абзаца нет, номер берётся у его предложений.
+        payload = _fixture_punctuated(fallback=True)
+        for paragraph in payload["paragraphs"]:
+            paragraph.pop("window")
+        path = _write_json(os.path.join(workdir, "window-from-sentences.json"), payload)
+        out = os.path.join(workdir, "window-from-sentences.md")
+        code, _, _ = _run(["--punctuated", path, "--out", out])
+        _check(code == 1, "прогон без window у абзацев вернул код %d" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(
+            len(doc.marks) == 1 and "окно 1, сегменты 100–142" in doc.marks[0],
+            "номер окна не взят у предложений: %r" % doc.marks,
+        )
+
+        # Предложение с пустым текстом выпадает, остальные остаются.
+        payload = _fixture_punctuated()
+        payload["sentences"][3]["text"] = "  "
+        path = _write_json(os.path.join(workdir, "blank.json"), payload)
+        out = os.path.join(workdir, "blank.md")
+        code, report, stderr = _run(["--punctuated", path, "--out", out])
+        _check(code == 1, "прогон с пустым предложением вернул код %d" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(
+            sum(len(paragraph) for paragraph in doc.paragraphs) == 5,
+            "пустое предложение попало в документ",
+        )
+        _check(len(doc.paragraphs) == 2, "абзац из одного пустого предложения не исчез")
+        _check("Предложений:   5" in report, "в отчёте не то число предложений")
+
+
+def _test_help() -> None:
+    """Справка — на русском, со всеми флагами, код 0."""
+    for flag in ("-h", "--help"):
+        code, out, _ = _run([flag])
+        _check(code == 0, "%s вернул код %d" % (flag, code))
+        for needle in ("--punctuated", "--summary", "--out", "--title", "--selftest", "Использование"):
+            _check(needle in out, "в справке (%s) нет %r" % (flag, needle))
+        _check(
+            re.search(r"[а-яА-Я]", out) is not None,
+            "справка не на русском",
+        )
+
+
+def selftest() -> int:
+    """Прогоняет встроенные проверки. Код возврата 0 — все прошли."""
+    tests = (
+        ("формат таймкодов", _test_timecodes),
+        ("обычный документ", _test_plain_document),
+        ("документ с окном в откате", _test_fallback_document),
+        ("отсутствующее саммари", _test_missing_summary),
+        ("непригодный вход и коды возврата", _test_broken_input),
+        ("неполный вход: абзацы, окна, source", _test_degraded_input),
+        ("справка", _test_help),
+    )
+    failed = 0
+    sys.stdout.write("================ СЕЛФ-ТЕСТ render_doc.py ================\n")
+    for name, test in tests:
+        try:
+            test()
+        except AssertionError as exc:
+            failed += 1
+            sys.stdout.write("[ПРОВАЛ] %s: %s\n" % (name, exc))
+        except Exception as exc:  # noqa: BLE001 — любое исключение здесь это провал теста
+            failed += 1
+            sys.stdout.write("[ОШИБКА] %s: %s: %s\n" % (name, type(exc).__name__, exc))
+        else:
+            sys.stdout.write("[ок]     %s\n" % name)
+
+    passed = len(tests) - failed
+    sys.stdout.write("\nПройдено %d из %d\n" % (passed, len(tests)))
+    if failed:
+        sys.stderr.write("%s: селф-тест не прошёл (%d проверок упало)\n" % (PROG, failed))
+        return 1
+    return 0
+
+
+# -------------------------------------------------------------------- main ---
+
+
+def main(argv: list[str]) -> int:
+    try:
+        opts = parse_args(argv)
+    except UsageError as exc:
+        return die(str(exc))
+
+    if opts["help"]:
+        sys.stdout.write(HELP)
+        return 0
+    if opts["selftest"]:
+        return selftest()
+
+    try:
+        check_args(opts)
+        data = load_punctuated(opts["punctuated"])
+        summary, note = read_summary(opts["summary"])
+        if note is not None:
+            # Нечитаемый фрагмент и вовсе не переданный --summary — не ошибка
+            # вызова, но и не норма продуктового прогона: про них говорим.
+            warn(note)
+        title = opts["title"].strip() if opts["title"] else default_title(data.source, opts["out"])
+
+        # Документ собирается целиком до записи: лучше упасть с внятным
+        # сообщением, чем оставить на диске половину результата.
+        content, stats = render_document(data, title, summary, opts["summary"])
+        write_text_file(opts["out"], content)
+    except (UsageError, DocumentError) as exc:
+        return die(str(exc))
+
+    try:
+        size = os.path.getsize(opts["out"])
+    except OSError:
+        size = len(content.encode("utf-8"))
+    print_report(opts["out"], size, stats)
+
+    # Код 1 — документ записан, но в нём есть пометки: сборочный скрипт обязан
+    # это заметить и сказать человеку, что прогон вышел неполным.
+    return 1 if stats.marks else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
