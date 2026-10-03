@@ -13,6 +13,9 @@
 # (docs/research/benchmark-plan.md, разделы 5 и 7):
 #   * план нарезки строится РОВНО ОДИН РАЗ и переиспользуется всеми моделями —
 #     иначе кандидаты получат разные чанки и сравнение скорости ничего не значит;
+#   * режим выбрасывания пауз (--drop-pause / --keep-pauses) печатается в сводке
+#     плана и попадает в summary.md: одну и ту же запись прогоняют в двух
+#     режимах, и по логу должно быть видно, который это из них;
 #   * модели прогоняются последовательно, а не параллельно, иначе они делят
 #     процессор и память друг с другом;
 #   * время и пик RSS снимаются /usr/bin/time -l (на macOS печатает maximum
@@ -46,6 +49,16 @@ DEVICE="cpu"
 DOWNLOAD_ROOT="$HOME/.cache/gigaam"
 SKIP_PREPARE=0
 KEEP_CHUNKS=1
+# Пусто — флаг не передан: нарезчик берёт своё значение по умолчанию, и вызов
+# tools/chunker.py остаётся таким же, как до появления этих флагов.
+DROP_PAUSE=""
+KEEP_PAUSES=0
+# «Паузы не выбрасывать» у нарезчика отдельным флагом не выражается: у него есть
+# только порог --drop-pause. Сутки заведомо больше любой паузы в любой записи,
+# поэтому при таком пороге ни один интервал тишины не уходит в dropped (там
+# сравнение pause <= --drop-pause), а центры всех пауз остаются кандидатами на
+# разрез — то есть резать по тишине план не перестаёт.
+KEEP_PAUSES_DROP="86400"
 
 usage() {
   cat <<'EOF'
@@ -61,6 +74,16 @@ usage() {
   --models "<список>"     чекпойнты через пробел (по умолчанию "v3_rnnt v3_e2e_rnnt")
   --device <устройство>   устройство для torch (по умолчанию cpu)
   --download-root <кат.>  каталог с весами GigaAM (по умолчанию ~/.cache/gigaam)
+  --drop-pause <сек>      выбрасывать из нарезки паузы длиннее указанной длины;
+                          значение передаётся в tools/chunker.py как --drop-pause.
+                          Без флага вызов нарезчика остаётся прежним, и порог
+                          берётся его собственный по умолчанию (2 с)
+  --keep-pauses           паузы не выбрасывать вовсе: нарезчику передаётся
+                          --drop-pause 86400 (сутки — больше любой паузы), так что
+                          в плане dropped_seconds = 0, а покрытие равно
+                          длительности записи. При обоих флагах в любом порядке
+                          --keep-pauses сильнее: значение --drop-pause
+                          игнорируется, о чём печатается предупреждение
   --skip-prepare          не готовить фрагмент через scripts/make_sample.sh,
                           даже если входного WAV нет (тогда это ошибка)
   --keep-chunks           оставить нарезанные чанки после прогона (по умолчанию)
@@ -90,6 +113,16 @@ warn() {
   printf 'transcribe_gigaam.sh: %s\n' "$1" >&2
 }
 
+# Значение в секундах проверяется здесь, при разборе аргументов, а не внутри
+# нарезчика: иначе опечатка в числе вылезла бы уже после проверки окружения,
+# весов и подготовки фрагмента — то есть через несколько минут прогона.
+require_seconds() {
+  case "$2" in
+    *[!0-9.]*|''|*.*.*|.)
+      die "$1 ожидает неотрицательное число секунд, получено: $2 (примеры: 0, 2, 2.5)" ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -98,6 +131,12 @@ while [ $# -gt 0 ]; do
     --models)        [ $# -ge 2 ] || die "--models требует список";        MODELS="$2";        shift 2 ;;
     --device)        [ $# -ge 2 ] || die "--device требует значение";      DEVICE="$2";        shift 2 ;;
     --download-root) [ $# -ge 2 ] || die "--download-root требует каталог"; DOWNLOAD_ROOT="$2"; shift 2 ;;
+    --drop-pause)
+      [ $# -ge 2 ] || die "--drop-pause требует значение в секундах"
+      require_seconds "--drop-pause" "$2"
+      DROP_PAUSE="$2"
+      shift 2 ;;
+    --keep-pauses)   KEEP_PAUSES=1;   shift ;;
     --skip-prepare)  SKIP_PREPARE=1; shift ;;
     --keep-chunks)   KEEP_CHUNKS=1;  shift ;;
     --no-chunks)     KEEP_CHUNKS=0;  shift ;;
@@ -113,6 +152,24 @@ done
 MODEL_LIST=()
 read -r -a MODEL_LIST <<<"$MODELS"
 [ "${#MODEL_LIST[@]}" -gt 0 ] || die "--models пуст: нечего прогонять"
+
+# ------------------------------------------------- режим выброса пауз ---
+
+# Конфликт флагов разрешается в пользу --keep-pauses, а не по порядку в командной
+# строке: «не выбрасывать» — это утверждение о результате прогона, и молча
+# превратить его в порог было бы хуже, чем проигнорировать число с
+# предупреждением. CHUNK_MODE дальше печатается в сводке плана и в summary.md.
+if [ "$KEEP_PAUSES" -eq 1 ]; then
+  if [ -n "$DROP_PAUSE" ]; then
+    warn "--keep-pauses сильнее --drop-pause: значение $DROP_PAUSE не используется, паузы не выбрасываются"
+  fi
+  DROP_PAUSE="$KEEP_PAUSES_DROP"
+  CHUNK_MODE="паузы не выбрасываются (--keep-pauses, нарезчику передан --drop-pause $KEEP_PAUSES_DROP с)"
+elif [ -n "$DROP_PAUSE" ]; then
+  CHUNK_MODE="выбрасываются паузы длиннее $DROP_PAUSE с (--drop-pause $DROP_PAUSE)"
+else
+  CHUNK_MODE="выбрасываются длинные паузы, порог по умолчанию tools/chunker.py (флаги нарезки не переданы)"
+fi
 
 # ---------------------------------------------------------------- хелперы ---
 
@@ -267,20 +324,30 @@ printf '  SHA-256:       %s\n' "$input_sha"
 PLAN="$OUTDIR/plan.json"
 
 printf '\n================ ПЛАН НАРЕЗКИ ================\n'
-printf '$ %s tools/chunker.py --input %s --outdir %s\n' "$PY" "$INPUT" "$OUTDIR"
-"$PY" tools/chunker.py --input "$INPUT" --outdir "$OUTDIR" \
-  || die "нарезка не удалась, прогон моделей не начинаем"
+# Две ветки, а не массив аргументов: без флагов нарезчик должен вызываться ровно
+# как раньше, без лишних аргументов, и в логе это видно построчно.
+if [ -n "$DROP_PAUSE" ]; then
+  printf '$ %s tools/chunker.py --input %s --outdir %s --drop-pause %s\n' \
+    "$PY" "$INPUT" "$OUTDIR" "$DROP_PAUSE"
+  "$PY" tools/chunker.py --input "$INPUT" --outdir "$OUTDIR" --drop-pause "$DROP_PAUSE" \
+    || die "нарезка не удалась, прогон моделей не начинаем"
+else
+  printf '$ %s tools/chunker.py --input %s --outdir %s\n' "$PY" "$INPUT" "$OUTDIR"
+  "$PY" tools/chunker.py --input "$INPUT" --outdir "$OUTDIR" \
+    || die "нарезка не удалась, прогон моделей не начинаем"
+fi
 [ -f "$PLAN" ] || die "chunker.py отработал, но плана нет: $PLAN"
 
 # Сводка плана считается из самого plan.json, а не из вывода нарезчика: в таблицу
 # и в анализ идут те же числа, которые реально прочитает transcribe.py.
 plan_summary() {
-  "$PY" - "$1" <<'PY'
+  "$PY" - "$1" "$2" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+mode = sys.argv[2]
 chunks = plan.get("chunks") or []
 durations = [chunk["duration"] for chunk in chunks]
 total = plan.get("source_duration")
@@ -290,6 +357,7 @@ share = ""
 if total and coverage is not None:
     share = f" ({coverage / total * 100:.1f} %)"
 
+print(f"  режим нарезки:      {mode}")
 print(f"  чанков:             {len(chunks)}")
 print(f"  покрытие:           {coverage} с из {total} с записи{share}")
 print(
@@ -303,7 +371,7 @@ PY
 }
 
 printf '\n== Сводка плана\n'
-plan_summary "$PLAN" || die "не удалось прочитать план: $PLAN"
+plan_summary "$PLAN" "$CHUNK_MODE" || die "не удалось прочитать план: $PLAN"
 
 # ----------------------------------------------------- прогон кандидатов ---
 
@@ -439,7 +507,7 @@ printf '\n================ СВОДНАЯ ТАБЛИЦА ================\n'
 # Таблица собирается из transcript.json, checks.json и time.txt — то есть из
 # файлов прогона, а не из перехваченного stdout: при повторном разборе выводов
 # числа обязаны сходиться с тем, что лежит на диске.
-"$PY" - "$OUTDIR" "$SUMMARY" "$ENV_LINE" "$INPUT_LINE" "$PLAN" "${MODEL_LIST[@]}" <<'PY'
+"$PY" - "$OUTDIR" "$SUMMARY" "$ENV_LINE" "$INPUT_LINE" "$PLAN" "$CHUNK_MODE" "${MODEL_LIST[@]}" <<'PY'
 import json
 import re
 import sys
@@ -450,7 +518,8 @@ summary_path = Path(sys.argv[2])
 env_line = sys.argv[3]
 input_line = sys.argv[4]
 plan_path = Path(sys.argv[5])
-models = sys.argv[6:]
+chunk_mode = sys.argv[6]
+models = sys.argv[7:]
 
 DASH = "—"
 PUNCT = ".,!?"
@@ -557,10 +626,10 @@ lines = [
     f"**Вход:** {input_line}.",
     "",
     (
-        f"**Нарезка:** {len(plan.get('chunks') or [])} чанков, покрытие "
-        f"{plan.get('coverage_seconds')} с, выброшено паузами "
-        f"{plan.get('dropped_seconds')} с; план `{plan_path.as_posix()}` "
-        f"один и тот же для всех моделей."
+        f"**Нарезка:** {chunk_mode}; {len(plan.get('chunks') or [])} чанков, покрытие "
+        f"{plan.get('coverage_seconds')} с из {plan.get('source_duration')} с, "
+        f"выброшено паузами {plan.get('dropped_seconds')} с; "
+        f"план `{plan_path.as_posix()}` один и тот же для всех моделей."
     ),
     "",
     "| " + " | ".join(header) + " |",
