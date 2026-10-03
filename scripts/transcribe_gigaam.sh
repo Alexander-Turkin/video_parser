@@ -34,6 +34,11 @@
 # Результаты пишутся только под --outdir внутри data/, который закрыт корневым
 # .gitignore, — текст лекции в репозиторий не попадает.
 #
+# Общая с другими прогонами часть — проверки окружения и весов, блоки «==
+# Окружение» и «== Вход», сводка плана — лежит в scripts/lib/common.sh.
+# Здесь остаётся только то, что делает этот скрипт бенчмарком: свой вход, свой
+# набор чекпойнтов, замер времени и сравнительная таблица.
+#
 # Использование:
 #   bash scripts/transcribe_gigaam.sh [опции]
 #
@@ -41,6 +46,18 @@
 # передавайте в кавычках.
 
 set -euo pipefail
+
+# Библиотека подключается по пути от корня репозитория — там же, где лежат
+# tools/*.py, которые скрипт вызывает ниже. Проверка до source своя: die ещё не
+# определён, а сообщение bash «No such file or directory» не подсказывает, что
+# дело в каталоге запуска.
+if [ ! -f scripts/lib/common.sh ]; then
+  printf 'transcribe_gigaam.sh: не найден scripts/lib/common.sh — запускайте скрипт из корня репозитория\n' >&2
+  exit 1
+fi
+SCRIPT_NAME="transcribe_gigaam.sh"
+# shellcheck source=scripts/lib/common.sh
+source scripts/lib/common.sh
 
 INPUT="data/samples/Лекция_1_01.09.26_1_t4514_300s_16k_mono.wav"
 OUTDIR="data/transcripts"
@@ -104,15 +121,6 @@ usage() {
 EOF
 }
 
-die() {
-  printf 'transcribe_gigaam.sh: %s\n' "$1" >&2
-  exit 1
-}
-
-warn() {
-  printf 'transcribe_gigaam.sh: %s\n' "$1" >&2
-}
-
 # Значение в секундах проверяется здесь, при разборе аргументов, а не внутри
 # нарезчика: иначе опечатка в числе вылезла бы уже после проверки окружения,
 # весов и подготовки фрагмента — то есть через несколько минут прогона.
@@ -171,67 +179,13 @@ else
   CHUNK_MODE="выбрасываются длинные паузы, порог по умолчанию tools/chunker.py (флаги нарезки не переданы)"
 fi
 
-# ---------------------------------------------------------------- хелперы ---
-
-# Байты -> человекочитаемый размер (как в scripts/make_sample.sh).
-fmt_bytes() {
-  awk -v b="${1:-}" 'BEGIN {
-    if (b == "") { print "n/a"; exit }
-    n = split("B KiB MiB GiB TiB", u, " "); i = 1
-    while (b >= 1024 && i < n) { b /= 1024; i++ }
-    f = (i == 1 ? "%d %s\n" : "%.2f %s\n")
-    printf f, b, u[i]
-  }'
-}
-
-# Версия установленного пакета без его импорта: importlib.metadata читает
-# метаданные дистрибутива, а import torch стоил бы несколько секунд на каждый
-# вызов и тянул бы в память весь фреймворк ради одной строки.
-pkg_version() {
-  "$PY" - "$1" <<'PY' 2>/dev/null || printf 'неизвестно\n'
-import sys
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    print(version(sys.argv[1]))
-except PackageNotFoundError:
-    print("не установлен")
-PY
-}
-
-# Файл токенизатора нужен не всем чекпойнтам: gigaam докачивает его только для
-# v1_rnnt и моделей с e2e в имени (см. _download_tokenizer в пакете).
-needs_tokenizer() {
-  case "$1" in
-    *e2e*|v1_rnnt) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 # --------------------------------------------------- проверка окружения ---
 
 [ -f tools/transcribe.py ] || die "не найден tools/transcribe.py — запускайте скрипт из корня репозитория"
 
-if [ -x ./.venv/bin/python ]; then
-  PY="./.venv/bin/python"
-elif command -v python3 >/dev/null 2>&1; then
-  PY="python3"
-else
-  die "не найден python: нет ни ./.venv/bin/python, ни python3 в PATH"
-fi
-
-command -v ffmpeg  >/dev/null 2>&1 || die "не найден ffmpeg (установите: brew install ffmpeg)"
-command -v ffprobe >/dev/null 2>&1 || die "не найден ffprobe (установите: brew install ffmpeg)"
-command -v shasum  >/dev/null 2>&1 || die "не найден shasum"
-
-# gigaam проверяется по наличию модуля, а не импортом: импорт тянет torch и стоит
-# секунды, а нам нужно лишь понять, тот ли это интерпретатор.
-"$PY" - <<'PY' || die "в интерпретаторе $PY нет пакета gigaam; используйте python из .venv проекта (ожидается ./.venv/bin/python)"
-import importlib.util
-import sys
-
-sys.exit(0 if importlib.util.find_spec("gigaam") else 1)
-PY
+PY="$(resolve_python)"
+require_tools
+require_python_gigaam "$PY"
 
 TIME_BIN="/usr/bin/time"
 if [ ! -x "$TIME_BIN" ]; then
@@ -240,15 +194,7 @@ if [ ! -x "$TIME_BIN" ]; then
 fi
 
 for model in "${MODEL_LIST[@]}"; do
-  ckpt="$DOWNLOAD_ROOT/$model.ckpt"
-  [ -f "$ckpt" ] || die "нет весов чекпойнта: $ckpt
-  Скачайте их заранее вручную и положите в $DOWNLOAD_ROOT — скрипт ничего не качает.
-  Передать другой каталог: --download-root <каталог>."
-  if needs_tokenizer "$model"; then
-    tok="$DOWNLOAD_ROOT/${model}_tokenizer.model"
-    [ -f "$tok" ] || die "нет токенизатора для $model: $tok
-  Чекпойнты v1_rnnt и *e2e* без него не работают. Положите файл рядом с $model.ckpt."
-  fi
+  require_weights "$model" "$DOWNLOAD_ROOT"
 done
 
 # ----------------------------------------------- подготовка фрагмента ---
@@ -272,32 +218,10 @@ mkdir -p "$OUTDIR"
 
 # ------------------------------------------------------ блок окружения ---
 
-mac_model="$(sysctl -n hw.model 2>/dev/null || printf 'неизвестно')"
-mac_cpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || printf 'неизвестно')"
-arch="$(uname -m)"
-os_name="$(sw_vers -productName 2>/dev/null || printf 'неизвестно')"
-os_version="$(sw_vers -productVersion 2>/dev/null || printf 'неизвестно')"
-os_build="$(sw_vers -buildVersion 2>/dev/null || printf 'неизвестно')"
-# Версия ffmpeg — первая строка `ffmpeg -version`, третье слово в ней.
-ffmpeg_version="$(ffmpeg -hide_banner -version 2>/dev/null | awk 'NR == 1 { print $3 }')"
-py_version="$("$PY" -V 2>&1 | awk '{ print $2 }')"
-torch_version="$(pkg_version torch)"
-torchaudio_version="$(pkg_version torchaudio)"
-gigaam_version="$(pkg_version gigaam)"
-input_size="$(stat -f%z "$INPUT" 2>/dev/null || printf '')"
-input_sha="$(shasum -a 256 "$INPUT" | awk '{ print $1 }')"
-input_duration="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 -i "$INPUT" 2>/dev/null | awk 'NR == 1 && $1 != "N/A" { printf "%.3f", $1 }' || printf '')"
-
-printf '\n== Окружение\n'
-printf '  Mac:            %s (%s, %s)\n' "$mac_model" "$mac_cpu" "$arch"
-printf '  ОС:             %s %s (%s)\n' "$os_name" "$os_version" "$os_build"
-printf '  ffmpeg:         %s\n' "${ffmpeg_version:-неизвестно}"
-printf '  python:         %s (%s)\n' "${py_version:-неизвестно}" "$PY"
-printf '  torch:          %s\n' "$torch_version"
-printf '  torchaudio:     %s\n' "$torchaudio_version"
-printf '  gigaam:         %s\n' "$gigaam_version"
-printf '  устройство:     %s\n' "$DEVICE"
-printf '  /usr/bin/time:  %s\n' "${TIME_BIN:-нет, пик RSS из метрик transcribe.py}"
+# Блок печатает scripts/lib/common.sh и попутно складывает значения в ENV_*:
+# ниже они же уходят в шапку summary.md, и считать их второй раз нельзя —
+# разошлись бы лог прогона и таблица.
+print_env_block "$DEVICE" "${TIME_BIN:-нет, пик RSS из метрик transcribe.py}"
 
 printf '\n== Чекпойнты (веса из %s)\n' "$DOWNLOAD_ROOT"
 for model in "${MODEL_LIST[@]}"; do
@@ -311,13 +235,9 @@ for model in "${MODEL_LIST[@]}"; do
   fi
 done
 
-# SHA-256 входа печатается отдельной строкой: протокол замера требует
-# подтверждать, что все кандидаты получили побайтово одинаковый вход.
-printf '\n== Вход\n'
-printf '  файл:          %s\n' "$INPUT"
-printf '  размер:        %s (%s байт)\n' "$(fmt_bytes "$input_size")" "${input_size:-n/a}"
-printf '  длительность:  %s с\n' "${input_duration:-неизвестно}"
-printf '  SHA-256:       %s\n' "$input_sha"
+# Блок «== Вход» тоже из библиотеки: он заполняет INPUT_SIZE, INPUT_DURATION и
+# INPUT_SHA, которые ниже попадают в summary.md.
+print_input_block "$INPUT"
 
 # ---------------------------------------------------------- план нарезки ---
 
@@ -337,38 +257,6 @@ else
     || die "нарезка не удалась, прогон моделей не начинаем"
 fi
 [ -f "$PLAN" ] || die "chunker.py отработал, но плана нет: $PLAN"
-
-# Сводка плана считается из самого plan.json, а не из вывода нарезчика: в таблицу
-# и в анализ идут те же числа, которые реально прочитает transcribe.py.
-plan_summary() {
-  "$PY" - "$1" "$2" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-mode = sys.argv[2]
-chunks = plan.get("chunks") or []
-durations = [chunk["duration"] for chunk in chunks]
-total = plan.get("source_duration")
-coverage = plan.get("coverage_seconds")
-
-share = ""
-if total and coverage is not None:
-    share = f" ({coverage / total * 100:.1f} %)"
-
-print(f"  режим нарезки:      {mode}")
-print(f"  чанков:             {len(chunks)}")
-print(f"  покрытие:           {coverage} с из {total} с записи{share}")
-print(
-    f"  выброшено паузами:  {plan.get('dropped_seconds')} с "
-    f"в {len(plan.get('dropped') or [])} интервалах"
-)
-if durations:
-    print(f"  длительность чанка: мин {min(durations):.3f} с, макс {max(durations):.3f} с")
-print(f"  параметры:          {json.dumps(plan.get('params') or {}, ensure_ascii=False)}")
-PY
-}
 
 printf '\n== Сводка плана\n'
 plan_summary "$PLAN" "$CHUNK_MODE" || die "не удалось прочитать план: $PLAN"
@@ -499,8 +387,8 @@ if [ "$KEEP_CHUNKS" -eq 0 ]; then
 fi
 
 SUMMARY="$OUTDIR/summary.md"
-ENV_LINE="$mac_model ($mac_cpu, $arch), $os_name $os_version ($os_build), ffmpeg ${ffmpeg_version:-неизвестно}, python ${py_version:-неизвестно}, torch $torch_version, torchaudio $torchaudio_version, gigaam $gigaam_version, устройство $DEVICE"
-INPUT_LINE="\`$INPUT\`, ${input_duration:-?} с, SHA-256 \`$input_sha\`"
+ENV_LINE="$ENV_MAC_MODEL ($ENV_MAC_CPU, $ENV_ARCH), $ENV_OS_NAME $ENV_OS_VERSION ($ENV_OS_BUILD), ffmpeg $ENV_FFMPEG_VERSION, python $ENV_PY_VERSION, torch $ENV_TORCH_VERSION, torchaudio $ENV_TORCHAUDIO_VERSION, gigaam $ENV_GIGAAM_VERSION, устройство $DEVICE"
+INPUT_LINE="\`$INPUT\`, ${INPUT_DURATION:-?} с, SHA-256 \`$INPUT_SHA\`"
 
 printf '\n================ СВОДНАЯ ТАБЛИЦА ================\n'
 
