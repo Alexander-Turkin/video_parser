@@ -44,8 +44,13 @@ DEFAULT_TOLERANCE = 0.05
 # (в разделе 7 это «не раньше 04:50 из 05:00»).
 COMPLETENESS_SLACK = 10.0
 
-# Покрытие: доля речи в сумме «сегменты + выброшенные паузы».
+# Покрытие: доля речи в сумме «сегменты + разрывы, не объяснённые планом».
 COVERAGE_MIN = 0.90
+
+# Разрыв считается объяснённым выброшенной паузой, если непокрытый остаток короче
+# этого: времена в плане и транскрипте округлены до миллисекунды, и остаток в
+# микросекунды — артефакт округления, а не потерянная речь.
+GAP_EPS = 0.002
 
 # Зацикливание: повтор подряд более этого числа раз — брак.
 LOOP_MAX_REPEATS = 3
@@ -513,12 +518,48 @@ def check_completeness(data, tolerance, plan_info):
     return check("полнота", [f"{where}; {reason}"], "")
 
 
+def gap_outside_plan(gap, pauses):
+    """Части разрыва, которым в плане нарезки не соответствует выброшенная пауза.
+
+    Возвращается список подынтервалов, а не одно число: писать в отчёт
+    «необъяснено 20 с» на разрыве шириной 45 с бессмысленно — читателю нужны
+    настоящие границы того места, где речь потерялась.
+    """
+    pieces = [(gap["start"], gap["end"])]
+    for pause in pauses:
+        rest = []
+        for start, end in pieces:
+            if pause["end"] <= start or pause["start"] >= end:
+                rest.append((start, end))
+                continue
+            if pause["start"] > start:
+                rest.append((start, pause["start"]))
+            if pause["end"] < end:
+                rest.append((pause["end"], end))
+        pieces = rest
+    return [
+        {"start": start, "end": end, "duration": end - start}
+        for start, end in pieces
+        if end - start > GAP_EPS
+    ]
+
+
 def check_coverage(data, plan_info):
-    """Покрытие: сколько речи в сумме «сегменты + выброшенные паузы».
+    """Покрытие: сколько речи в сумме «сегменты + ничем не объяснённые разрывы».
 
     Данных о выброшенных паузах в транскрипте нет, поэтому они оцениваются как
     разрывы между соседними сегментами. Сами разрывы нарушением не считаются:
     выбрасывать паузы длиннее 2 с — решение владельца, дыры в таймкодах законны.
+    Поэтому разрыв, подтверждённый выброшенной паузой из plan.json, в знаменатель
+    не идёт — иначе проверка падала бы ровно за то, что пайплайн делает по
+    замыслу: на прогоне 2026-10-03 речь занимала 84.5 % записи при 15.5 %
+    выброшенных пауз, то есть порог 90 % был недостижим в принципе. Так же
+    устроена и проверка полноты: подтверждённый планом хвост она прощает.
+
+    Что проверка ловит после этого: разрывы, которым в плане объяснения нет, —
+    то есть участки, которые нарезка отдала модели, а речи из них в транскрипте
+    не оказалось. Если план недоступен, подтверждать нечем: в знаменатель идут
+    все разрывы, и в выводе сказано, что работали без плана.
     """
     segments = data["segments"]
     speech = sum(max(0.0, segment["end"] - segment["start"]) for segment in segments)
@@ -531,10 +572,21 @@ def check_coverage(data, plan_info):
                 gaps.append({"start": previous["end"], "end": segment["start"], "duration": gap})
         previous = segment
     dropped = sum(gap["duration"] for gap in gaps)
-    total = speech + dropped
+
+    plan_pauses = plan_info.get("dropped") or []
+    if plan_info.get("path") is None:
+        unexplained_gaps = list(gaps)
+        unexplained = dropped
+    else:
+        unexplained_gaps = []
+        for gap in gaps:
+            unexplained_gaps.extend(gap_outside_plan(gap, plan_pauses))
+        unexplained = sum(gap["duration"] for gap in unexplained_gaps)
+    total = speech + unexplained
 
     numbers = (
         f"речь {sec(speech)}, разрывов {len(gaps)} на {sec(dropped)}, "
+        f"из них не объяснено планом {sec(unexplained)}, "
         f"итого {sec(total)}, покрытие {percent(speech / total) if total > 0 else '—'} "
         f"при пороге {percent(COVERAGE_MIN)}"
     )
@@ -542,6 +594,12 @@ def check_coverage(data, plan_info):
         widest = max(gaps, key=lambda gap: gap["duration"])
         numbers += (
             f"\nсамый длинный разрыв {sec(widest['duration'])}: "
+            f"{format_hms(widest['start'])}–{format_hms(widest['end'])}"
+        )
+    if unexplained_gaps and plan_info.get("path") is not None:
+        widest = max(unexplained_gaps, key=lambda gap: gap["duration"])
+        numbers += (
+            f"\nсамый длинный необъяснённый разрыв {sec(widest['duration'])}: "
             f"{format_hms(widest['start'])}–{format_hms(widest['end'])}"
         )
     if plan_info.get("path") is None:
@@ -555,9 +613,9 @@ def check_coverage(data, plan_info):
             numbers += f"\nплан {plan_info['path']} найден, но dropped_seconds в нём нет"
         else:
             numbers += (
-                f"\nпо плану {plan_info['path']} выброшено {sec(plan_dropped)}; "
-                f"расхождение с оценкой по разрывам {sec(abs(plan_dropped - dropped))} "
-                f"(хвостовая и головная паузы в разрывы между сегментами не попадают)"
+                f"\nпо плану {plan_info['path']} выброшено {sec(plan_dropped)} "
+                f"в {len(plan_pauses)} паузах; разрывы, совпавшие с ними, "
+                f"в знаменатель не идут"
             )
 
     if total <= 0:
@@ -1218,6 +1276,38 @@ def _check_coverage_numbers():
         assert "самый длинный разрыв 45.000 с" in output, output
 
 
+def _check_coverage_against_plan():
+    """Разрыв, подтверждённый планом, покрытие не портит; необъяснённый — портит."""
+    segments = [
+        _segment(0, 0.0, 5.0, "короткая реплика в начале"),
+        _segment(1, 50.0, 58.0, "короткая реплика в конце записи"),
+    ]
+    transcript = dict(_good_transcript(), segments=segments)
+    base_plan = {
+        "schema": PLAN_SCHEMA,
+        "source": "data/samples/fragment.wav",
+        "source_duration": 60.0,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        # Весь разрыв 5–50 с — выброшенная пауза: это замысел нарезки, не дефект.
+        plan = dict(base_plan, dropped=[{"start": 5.0, "end": 50.0}], dropped_seconds=45.0)
+        transcript_path, _ = _fixture(tmp, transcript, plan=plan)
+        code, output = _run_cli(["--transcript", str(transcript_path)])
+        assert code == 0, (code, output)
+        assert _statuses(output)["покрытие"] == "PASS", output
+        assert "не объяснено планом 0.000 с" in output, output
+
+        # Планом подтверждена только часть разрыва: остаток 20 с — потерянная речь.
+        plan = dict(base_plan, dropped=[{"start": 5.0, "end": 30.0}], dropped_seconds=25.0)
+        transcript_path, _ = _fixture(tmp, transcript, plan=plan, name="полпаузы")
+        code, output = _run_cli(["--transcript", str(transcript_path)])
+        assert code == 1, (code, output)
+        _expect_only_failed(output, "покрытие")
+        assert "не объяснено планом 20.000 с" in output, output
+        assert "необъяснённый разрыв 20.000 с" in output, output
+        assert "00:00:30.000–00:00:50.000" in output, output
+
+
 def _check_tolerance_flag():
     """--tolerance: мелкое наложение в пределах допуска нарушением не считается."""
     transcript = _good_transcript()
@@ -1387,6 +1477,7 @@ CHECKS = (
     ("битый SRT: пустой текст, пересечение, выход за запись", _check_srt_other_defects),
     ("полнота: выброшенный хвост с планом и без", _check_completeness_tail),
     ("покрытие: цифры и падение ниже 90 %", _check_coverage_numbers),
+    ("покрытие: разрыв сверяется с планом нарезки", _check_coverage_against_plan),
     ("--tolerance меняет вердикт", _check_tolerance_flag),
     ("--json пишет итог схемы checks/1", _check_machine_report),
     ("непригодный вход даёт код 2", _check_bad_input),
@@ -1437,11 +1528,13 @@ def build_parser():
             "      --srt data/out/v3_rnnt.srt --json data/out/v3_rnnt.checks.json\n"
             "  python tools/check_timecodes.py --selftest\n\n"
             "Как считается покрытие: данных о выброшенных паузах в транскрипте нет,\n"
-            "поэтому они оцениваются как разрывы между соседними сегментами, а поля\n"
-            "dropped и dropped_seconds из plan.json (путь берётся из поля plan)\n"
-            "печатаются как сверка. Если план недоступен, инструмент говорит об этом\n"
-            "в выводе. Дыры в таймкодах сами по себе нарушением не считаются:\n"
-            "нарезка выбрасывает паузы длиннее 2 с.\n\n"
+            "поэтому они оцениваются как разрывы между соседними сегментами и\n"
+            "сверяются с полем dropped из plan.json (путь берётся из поля plan).\n"
+            "Разрыв, совпавший с выброшенной паузой, в знаменатель не идёт: дыры в\n"
+            "таймкодах сами по себе нарушением не считаются, нарезка выбрасывает\n"
+            "паузы длиннее 2 с. Проверка ловит разрывы, которым в плане объяснения\n"
+            "нет. Если план недоступен, подтверждать нечем: в знаменатель идут все\n"
+            "разрывы, и инструмент говорит об этом в выводе.\n\n"
             "Коды возврата: 0 — все проверки прошли, 1 — хотя бы одна FAIL,\n"
             "2 — входные данные непригодны (файла нет, битый JSON, чужая схема)."
         ),

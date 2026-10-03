@@ -242,7 +242,7 @@ def plan_chunks(
         raw.extend(_cut_segment(start, end, end_reason, number, cut_points, params))
 
     raw = _merge_short_tails(raw, params)
-    raw, floor_dropped = _fix_tiny_chunks(raw, params)
+    raw, floor_dropped = _fix_tiny_chunks(raw, quiet, params)
     dropped.extend(floor_dropped)
 
     chunks: list[Chunk] = []
@@ -383,19 +383,37 @@ def _merge_short_tails(raw: list[_Raw], params: PlanParams) -> list[_Raw]:
     return merged
 
 
+def _sound_seconds(start: float, end: float, quiet: list[tuple[float, float]]) -> float:
+    """Сколько в интервале звука, а не тишины."""
+    silence = 0.0
+    for s, e in quiet:
+        overlap = min(end, e) - max(start, s)
+        if overlap > 0:
+            silence += overlap
+    return max(0.0, end - start - silence)
+
+
 def _fix_tiny_chunks(
-    raw: list[_Raw], params: PlanParams
+    raw: list[_Raw], quiet: list[tuple[float, float]], params: PlanParams
 ) -> tuple[list[_Raw], list[Dropped]]:
-    """Убирает чанки короче MIN_CHUNK_FLOOR: присоединяет или выбрасывает.
+    """Убирает чанки, в которых звука меньше MIN_CHUNK_FLOOR: присоединяет или выбрасывает.
 
     Такой огрызок появляется, например, между двумя длинными паузами, когда
     звука между ними меньше секунды. Присоединять его можно только к соседу по
     тому же отрезку: чанк не имеет права перешагнуть выброшенную паузу.
+
+    Мерить здесь нужно именно звук, а не длину интервала: в неё входят --pad по
+    краям и короткие паузы внутри, которые разрезом не стали. На прогоне
+    2026-10-03 это вышло наружу — чанк 00:03:13.983–00:03:15.600 длиной 1.617 с
+    содержал 0.971 с звука, и оба чекпойнта GigaAM вернули по нему пустой текст.
+    Пустой сегмент в транскрипте — нарушение допуска (benchmark-plan.md,
+    раздел 7), то есть отдавать такой огрызок модели нельзя.
     """
     out: list[_Raw] = []
     dropped: list[Dropped] = []
     for item in raw:
-        if item.dur >= MIN_CHUNK_FLOOR - EPS:
+        sound = _sound_seconds(item.start, item.end, quiet)
+        if sound >= MIN_CHUNK_FLOOR - EPS:
             out.append(item)
             continue
         prev = out[-1] if out else None
@@ -412,8 +430,9 @@ def _fix_tiny_chunks(
                 end=_round(item.end),
                 duration=_round(item.dur),
                 reason=(
-                    f"чанк короче {MIN_CHUNK_FLOOR:.1f} с и не присоединяется "
-                    f"к предыдущему без выхода за --hard-max-chunk"
+                    f"звука в чанке {sound:.3f} с — короче {MIN_CHUNK_FLOOR:.1f} с, "
+                    f"и присоединить к предыдущему нельзя без выхода "
+                    f"за --hard-max-chunk"
                 ),
             )
         )
@@ -1042,6 +1061,26 @@ def selftest() -> int:
     check(
         all(c.duration >= MIN_CHUNK_FLOOR for c in chunks),
         "огрызок между паузами: в плане остался чанк короче минимума",
+    )
+    cases_done += 1
+
+    # --- 5a. Огрызок длиннее секунды, но звука в нём меньше секунды ------------
+    # Регрессия прогона 2026-10-03: в длину интервала входят --pad по краям и
+    # короткая пауза внутри, поэтому мерить минимум её нельзя. Здесь остров между
+    # двумя выброшенными паузами длиной 2.2 с, а звука в нём 0.6 с — модель по
+    # такому чанку возвращает пустой текст, а пустой сегмент не проходит допуск
+    # (benchmark-plan.md, раздел 7).
+    params = _selftest_params()
+    chunks, dropped = plan_chunks(30.0, [(5.0, 9.0), (9.5, 10.9), (11.0, 15.0)], params)
+    failures += _invariants("огрызок по звуку", 30.0, chunks, dropped, params)
+    check(
+        len(chunks) == 2,
+        "огрызок по звуку: ожидалось 2 чанка, получено "
+        + f"{len(chunks)}: " + ", ".join(f"{c.start}–{c.end}" for c in chunks),
+    )
+    check(
+        any("звука в чанке" in d.reason for d in dropped),
+        "огрызок по звуку: остров 8.9–11.1 (2.2 с длиной, 0.6 с звука) остался в плане",
     )
     cases_done += 1
 
