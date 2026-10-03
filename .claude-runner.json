@@ -1,0 +1,13 @@
+{
+  "extraAllow": [
+    "Bash(bash scripts/*)",
+    "Bash(bash -n scripts/*)",
+    "Bash(bash \"/Users/alexander/my projects/vidio_parser/scripts/*)",
+    "Bash(./scripts/*)",
+    "Bash(scripts/*)",
+    "Bash(ffmpeg *)",
+    "Bash(ffprobe *)"
+  ],
+  "extraDeny": [],
+  "extraDirs": ["/tmp/lecture-frames"]
+}
