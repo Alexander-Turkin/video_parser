@@ -5,23 +5,29 @@
 рабочий подкаталог, в котором лежит всё, что понадобилось по пути: audio.wav
 (часто гигабайты), chunks/ с сотнями кусков, plan.json, transcript.txt,
 transcript.srt, checks.json, checks.txt, claude/ с промптами и ответами,
-run.log. Из этого стоит хранить ровно три файла:
+run.log. Из этого стоит хранить ровно шесть файлов:
 
   transcript.json   дословное распознавание с таймкодами — его не воспроизвести
                     без двух часов работы модели;
-  punctuated.json   то же с пунктуацией и предложениями — цена восстановления
-                    это десятки вызовов claude;
-  summary.md        фрагмент саммари — один вызов claude, но по живой записи.
+  diarization.json  интервалы говорящих — pyannote на CPU считает примерно в
+                    реальном времени, на лекции это десятки минут;
+  punctuated.json   распознанное с пунктуацией и предложениями — цена
+                    восстановления это десятки вызовов claude;
+  summary.md        фрагмент саммари — один вызов claude, но по живой записи;
+  roles.json        роли говорящих («Преподаватель», «Студент N») — ещё один
+                    вызов claude;
+  speakers.json     расшифровка, разбитая на фразы с говорящими — считается
+                    локально за секунды, но только из первых трёх файлов.
 
-Всё остальное либо воспроизводится из этих трёх файлов за секунды, либо вообще
+Всё остальное либо воспроизводится из этих шести файлов за секунды, либо вообще
 не нужно после сборки документа. Инструмент удаляет всё остальное.
 
 Решения, которые стоит знать, прежде чем читать код:
 
 * Белый список один и тот же для любого каталога. Проверки «похож ли каталог на
-  прогон» здесь сознательно нет: владелец решил, что трёх имён-хранителей
-  достаточно, а предупреждения про «чужой каталог» только мешают. Отсюда же
-  --run, который чистит ровно то, что ему дали.
+  прогон» здесь сознательно нет: имён-хранителей достаточно, а предупреждения
+  про «чужой каталог» только мешают. Отсюда же --run, который чистит ровно то,
+  что ему дали.
 * По символическим ссылкам инструмент не переходит нигде. audio.wav у прогона —
   это обычно ссылка на исходную запись пользователя (её делает
   scripts/transcribe_lecture.sh, когда вход уже 16 кГц моно WAV), и удалить по
@@ -64,8 +70,16 @@ PROG = "cleanup_runs.py"
 
 # Файлы-хранители: остаются в каталоге, всё прочее удаляется. Порядок задаёт
 # порядок в отчёте — от самого дорогого к самому дешёвому по стоимости
-# повторного получения.
-KEEP_NAMES = ("transcript.json", "punctuated.json", "summary.md")
+# повторного получения: часы работы модели, десятки минут pyannote на CPU,
+# десятки вызовов claude, один вызов claude, один вызов claude, секунды локально.
+KEEP_NAMES = (
+    "transcript.json",
+    "diarization.json",
+    "punctuated.json",
+    "summary.md",
+    "roles.json",
+    "speakers.json",
+)
 
 # Корень берётся от расположения файла, а не от текущего каталога: инструмент
 # чистит data/output этого проекта, и результат не должен зависеть от того,
@@ -74,6 +88,12 @@ KEEP_NAMES = ("transcript.json", "punctuated.json", "summary.md")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ROOT = os.path.join(REPO_ROOT, "data", "output")
 
+# Хранители в справке — по три имени в строке: шесть имён одной строкой не влезают
+# в 80 столбцов и в терминале переносятся как попало.
+KEEP_NAMES_HELP = "\n".join(
+    "  " + ", ".join(KEEP_NAMES[start:start + 3]) for start in range(0, len(KEEP_NAMES), 3)
+)
+
 HELP = f"""Использование:
   python tools/cleanup_runs.py [--dry-run]
   python tools/cleanup_runs.py --run <каталог> [--dry-run]
@@ -81,12 +101,12 @@ HELP = f"""Использование:
 
 Чистит рабочие подкаталоги прогонов: в каталоге остаются только файлы-хранители
 
-  {", ".join(KEEP_NAMES)}
+{KEEP_NAMES_HELP}
 
 а всё остальное удаляется — audio.wav, plan.json, chunks/, transcript.txt,
 transcript.srt, checks.json, checks.txt, claude/, run.log и любые другие файлы и
 подкаталоги (вложенные — рекурсивно). Каталог, в котором не осталось ни одного
-файла-хранителя, удаляется целиком вместе с содержимым.
+из этих шести файлов, удаляется целиком вместе с содержимым.
 
 ВНИМАНИЕ: удаление необратимо. Файлы не переносятся в корзину и не
 архивируются, восстановить их нечем. Посмотрите сначала, что будет удалено,
@@ -101,7 +121,7 @@ transcript.srt, checks.json, checks.txt, claude/, run.log и любые друг
 
 Опции:
   --run <каталог>  обработать ровно один указанный каталог — любой, проверки
-                   «похож ли он на прогон» нет: белого списка из трёх файлов
+                   «похож ли он на прогон» нет: белого списка из шести файлов
                    достаточно
   --dry-run        только показать, что было бы удалено, и не удалять ничего
   --selftest       прогнать встроенные проверки и выйти
@@ -833,11 +853,11 @@ def _test_report() -> None:
 
         for needle in (
             "ОЧИСТКА ПРОГОНОВ",
-            "Хранители:   transcript.json, punctuated.json, summary.md",
+            "Хранители:   %s" % ", ".join(KEEP_NAMES),
             "удаление, необратимо",
             "Каталог: %s" % full,
             "удалено:",
-            "оставлено: transcript.json, punctuated.json, summary.md",
+            "оставлено: %s" % ", ".join(KEEP_NAMES),
             "chunks/ — 3 файла,",
             "claude/ — 2 файла,",
             "audio.wav —",
@@ -920,7 +940,11 @@ def _test_dry_run() -> None:
         _check(code == 0, "--dry-run вернул код %d" % code)
         _check(_snapshot(root) == before, "--dry-run изменил что-то на диске")
         _check(os.path.isdir(broken), "--dry-run удалил каталог без хранителей")
-        _check(len(_names(full)) == 12, "--dry-run тронул содержимое: %r" % _names(full))
+        # Девять лишних записей из _make_run плюс все хранители — ни одной меньше.
+        _check(
+            len(_names(full)) == 9 + len(KEEP_NAMES),
+            "--dry-run тронул содержимое: %r" % _names(full),
+        )
 
         # Полный список удаляемого: каждая верхнеуровневая запись названа.
         for name in (
@@ -931,7 +955,7 @@ def _test_dry_run() -> None:
         for needle in (
             "--dry-run, только показать: ничего не удаляется",
             "будет удалено:",
-            "останется: transcript.json, punctuated.json, summary.md",
+            "останется: %s" % ", ".join(KEEP_NAMES),
             "файлов-хранителей нет: каталог был бы удалён целиком",
             "Было бы удалено:",
             "Это был --dry-run: на диске ничего не изменилось.",
@@ -1100,6 +1124,7 @@ def _test_keeper_edges() -> None:
         # и каталог прогона уходит целиком, потому что хранителей в нём нет.
         tricky = os.path.join(root, "каталог-вместо-файла")
         _write(os.path.join(tricky, "summary.md", "внутри.txt"), "вложенное\n")
+        _write(os.path.join(tricky, "diarization.json", "внутри.txt"), "вложенное\n")
         code, _, _ = _capture(lambda: cleanup(root, None, False))
         _check(code == 0, "каталог с именем хранителя вернул код %d" % code)
         _check(not os.path.exists(tricky), "каталог с именем хранителя остался: %s" % tricky)
@@ -1107,14 +1132,17 @@ def _test_keeper_edges() -> None:
         # Ссылка с именем хранителя — тоже не хранитель: по ней не ходят, значит
         # оставлять её незачем. Цель ссылки при этом не затрагивается.
         target = _write(os.path.join(workdir, "настоящий summary.md"), "саммари\n")
+        diar = _write(os.path.join(workdir, "настоящий diarization.json"), '{"schema": "x"}\n')
         linked = os.path.join(root, "прогон со ссылкой-хранителем")
         os.makedirs(linked)
         os.symlink(target, os.path.join(linked, "summary.md"))
+        os.symlink(diar, os.path.join(linked, "diarization.json"))
         _write(os.path.join(linked, "transcript.json"), "{}\n")
         code, _, _ = _capture(lambda: cleanup(root, None, False))
         _check(code == 0, "ссылка с именем хранителя вернула код %d" % code)
         _check(_names(linked) == ["transcript.json"], "осталось: %r" % _names(linked))
         _check(os.path.isfile(target), "цель ссылки-хранителя удалена")
+        _check(os.path.isfile(diar), "цель ссылки diarization.json удалена")
 
         # Каталог, где только хранители и ничего больше, остаётся как был.
         clean = _make_run(root, "уже чистый", keepers=KEEP_NAMES)
@@ -1130,6 +1158,73 @@ def _test_keeper_edges() -> None:
         _check(code == 0, "чистый каталог вернул код %d" % code)
         _check(_snapshot(clean) == before, "чистый каталог изменён")
         _check("удалять нечего" in report, "про чистый каталог не сказано, что чистить нечего")
+
+
+def _test_new_keepers() -> None:
+    """Диаризация, фразы и роли остаются после чистки, и каждая спасает каталог.
+
+    Отдельной проверкой, а не строчкой в «чистке всего корня»: diarization.json
+    стоит десятки минут pyannote на CPU, speakers.json и roles.json без него не
+    пересобрать, и потерять их при чистке — значит оплатить всё это второй раз.
+    """
+    expected = (
+        "transcript.json",
+        "diarization.json",
+        "punctuated.json",
+        "summary.md",
+        "roles.json",
+        "speakers.json",
+    )
+    _check(
+        KEEP_NAMES == expected,
+        "список хранителей %r, ожидался %r" % (KEEP_NAMES, expected),
+    )
+
+    with _tempdir("new-keepers") as workdir:
+        root = os.path.join(workdir, "output")
+        os.makedirs(root)
+
+        # Полный прогон с диаризацией: все шесть файлов на месте и не переписаны.
+        full = _make_run(root, "прогон с диаризацией")
+        code, report, stderr = _capture(lambda: cleanup(root, None, False))
+        _check(code == 0, "чистка прогона с диаризацией вернула код %d" % code)
+        _check(not stderr.strip(), "чистка с диаризацией написала в stderr: %s" % stderr)
+        for name in ("diarization.json", "speakers.json", "roles.json"):
+            path = os.path.join(full, name)
+            _check(os.path.isfile(path), "хранитель %s удалён при чистке" % name)
+            with open(path, "r", encoding="utf-8") as handle:
+                _check(
+                    handle.read() == "содержимое %s\n" % name,
+                    "содержимое хранителя %s изменилось" % name,
+                )
+        _check(_names(full) == sorted(KEEP_NAMES), "в прогоне осталось: %r" % _names(full))
+        _check(
+            "оставлено: %s" % ", ".join(KEEP_NAMES) in report,
+            "в отчёте нет всех шести оставленных:\n%s" % report,
+        )
+
+        # Каждый из трёх новых хранителей сам по себе спасает каталог: из шести
+        # файлов в каталоге есть только он, и «нет хранителей» не срабатывает.
+        singles = {
+            name: _make_run(root, "только %s" % name, keepers=(name,))
+            for name in ("diarization.json", "speakers.json", "roles.json")
+        }
+        code, report, _ = _capture(lambda: cleanup(root, None, False))
+        _check(code == 0, "чистка каталогов с одним хранителем вернула код %d" % code)
+        for name, path in singles.items():
+            _check(os.path.isdir(path), "каталог, где из шести файлов только %s, удалён" % name)
+            _check(
+                _names(path) == [name],
+                "в каталоге с одним %s осталось: %r" % (name, _names(path)),
+            )
+            _check(
+                "оставлено: %s\n" % name in report,
+                "в отчёте нет «оставлено: %s»:\n%s" % (name, report),
+            )
+        _check(
+            "каталог удалён целиком" not in report,
+            "каталог с одним хранителем удалён целиком:\n%s" % report,
+        )
 
 
 def _test_failed_removal() -> None:
@@ -1230,6 +1325,7 @@ def selftest() -> int:
         ("негодные аргументы и пути", _test_bad_args),
         ("корня нет, корень пуст, одни документы", _test_missing_root),
         ("пограничные случаи с хранителями", _test_keeper_edges),
+        ("диаризация, фразы и роли остаются", _test_new_keepers),
         ("отказ в доступе при удалении", _test_failed_removal),
         ("открытый на запись run.log", _test_open_file),
         ("справка", _test_help),
