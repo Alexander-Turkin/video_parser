@@ -24,17 +24,30 @@
 #     нет намеренно — в расшифровке лекции дыра на месте выброшенной паузы
 #     означает потерянные слова, а замер по эталону показал, что в этом режиме
 #     WER ниже;
+#   * диаризация (кто и когда говорил) идёт после удачного распознавания, а не
+#     до него: на CPU pyannote считает примерно в реальном времени, и тратить
+#     эти десятки минут на прогон, у которого транскрипта так и не вышло, было
+#     бы бессмысленно. Веса pyannote не скачиваются — нужен заранее
+#     подготовленный локальный кэш, см. tools/diarize.py;
 #   * пунктуацию ставит claude окнами по --window сегментов, и после каждого
 #     окна tools/punctuate.py сверяет последовательность слов с выходом модели:
 #     claude расставляет знаки, заглавные и абзацы, но менять слова ему запрещено.
 #     Окно, не прошедшее сверку, откатывается к дословному тексту и помечается
 #     в документе — лучше видимая пометка, чем незаметно переписанная лекция;
+#   * фразы с говорящими и роли считаются по готовой пунктуации: границы фраз
+#     берут абзацы из punctuated.json, а роли («Преподаватель», «Студент N»)
+#     определяет claude по тексту уже разбитой на фразы расшифровки;
 #   * саммари делается одним отдельным вызовом по всему тексту: окна для него не
-#     годятся, изложение и темы нужны по записи целиком.
+#     годятся, изложение и темы нужны по записи целиком, зато ярлыки говорящих к
+#     этому моменту уже есть — и в саммари видно, кто что сказал.
 #
 # Веса не скачиваются: чекпойнт должен уже лежать в --download-root. Отсутствие
 # claude прогон не останавливает — расшифровка в этом случае всё равно будет
-# собрана, но с пометками «не получено» и ненулевым кодом возврата.
+# собрана, но с пометками «не получено» и ненулевым кодом возврата. Так же
+# устроены и шаги говорящих: не получилась диаризация, не удалась привязка фраз
+# или не вышли роли — документ собирается без ярлыков, в нём встаёт видимая
+# пометка с причиной, код возврата 1. Совсем отказаться от этих шагов можно
+# флагом --no-diarize, а подложить готовый файл — флагом --diarization.
 #
 # Убирать за собой скрипт умеет флагом --clean, и удаляет при этом не сам: он
 # зовёт tools/cleanup_runs.py --run <рабочий подкаталог>. Что считать лишним,
@@ -76,6 +89,8 @@ FROM_TRANSCRIPT=""
 WINDOW="100"
 KEEP_CHUNKS=1
 CLEAN=0
+DIARIZE=1
+DIARIZATION_IN=""
 
 # Режим нарезки у этой команды один и не настраивается (см. шапку). Значение
 # передаётся нарезчику как --drop-pause и печатается в сводке плана.
@@ -89,8 +104,8 @@ usage() {
 Расшифровка записи целиком одной командой: любой читаемый ffmpeg медиафайл
 (webm, mp4, mp3, m4a, wav) приводится к 16 кГц моно WAV, режется по тишине без
 выбрасывания пауз, распознаётся GigaAM, пунктуацию расставляет claude без
-изменения слов, после чего собирается один markdown: саммари и расшифровка по
-предложениям с таймкодами.
+изменения слов, pyannote определяет, кто и когда говорил, после чего собирается
+один markdown: саммари и расшифровка фразами с ярлыком говорящего.
 
 Опции:
   --input <путь>          входной медиафайл (обязателен; при --from-transcript
@@ -103,19 +118,30 @@ usage() {
   --from-transcript <п.>  взять готовый transcript.json и переделать только
                           пунктуацию, саммари и итоговый документ: конвертация,
                           нарезка, распознавание, .txt/.srt и проверки
-                          таймкодов пропускаются
+                          таймкодов пропускаются. Шаги говорящих без
+                          --diarization пропускаются тоже (звука под рукой уже
+                          нет), и это не пометка — код возврата не меняется
   --window <число>        сколько сегментов отправлять claude в одном окне
                           пунктуации (по умолчанию 100)
+  --no-diarize            не определять говорящих: шаги диаризации, фраз и
+                          ролей пропускаются целиком, расшифровка идёт
+                          предложениями без ярлыков. Это не пометка: безупречный
+                          прогон с этим флагом по-прежнему даёт код 0
+  --diarization <путь>    взять готовый diarization.json схемы diarization/1
+                          вместо прогона pyannote (файл копируется в рабочий
+                          подкаталог); фразы и роли считаются как обычно.
+                          С --no-diarize несовместим
   --keep-chunks           оставить нарезанные чанки (по умолчанию)
   --no-chunks             удалить чанки после распознавания, план оставить
   --clean                 после сборки документа вычистить рабочий подкаталог
                           вызовом tools/cleanup_runs.py --run <подкаталог>:
-                          удаляются audio.wav, plan.json, chunks/, transcript.txt,
-                          transcript.srt, checks.json, checks.txt, claude/ и
-                          run.log, остаются только transcript.json,
-                          punctuated.json и summary.md. Чистка идёт строго при
-                          коде возврата 0: при 1 (есть пометки) и при 2 (итога
-                          нет) не удаляется ничего, а причина пропуска
+                          удаляются audio.wav, plan.json, chunks/, .txt и .srt,
+                          проверки таймкодов, claude/ и run.log, а результаты
+                          шагов остаются. Что именно считать лишним, решает тот
+                          инструмент — список файлов-хранителей живёт там, см.
+                          python tools/cleanup_runs.py --help. Чистка идёт
+                          строго при коде возврата 0: при 1 (есть пометки) и при
+                          2 (итога нет) не удаляется ничего, а причина пропуска
                           печатается
   -h, --help              показать эту справку
 
@@ -137,34 +163,44 @@ usage() {
       transcript.txt                читаемый текст
       transcript.srt                субтитры
       checks.json, checks.txt       проверки таймкодов
+      diarization.json              кто и когда говорил (нет при --no-diarize)
       punctuated.json               предложения с пунктуацией и таймкодами
+      speakers.json                 фразы с говорящими
+      roles.json                    роли говорящих: «Преподаватель», «Студент N»
       summary.md                    фрагмент саммари
       claude/                       промпты и ответы claude по вызовам
       run.log                       весь вывод этого прогона
 
 При --clean и безупречном прогоне от этого подкаталога остаются только
-transcript.json, punctuated.json и summary.md. Удаляется в том числе run.log:
+результаты шагов, всё промежуточное удаляется. Удаляется в том числе run.log:
 на экран прогон допишется до конца, но лога на диске потом не будет — искать
 его после --clean негде.
 
 Порядок шагов: to_wav -> tools/chunker.py -> tools/transcribe.py ->
-tools/outputs.py -> tools/check_timecodes.py -> tools/punctuate.py ->
+tools/outputs.py -> tools/check_timecodes.py -> tools/diarize.py ->
+tools/punctuate.py -> tools/speakers.py -> tools/roles.py ->
 tools/summarize.py -> tools/render_doc.py, при --clean в конце ещё
-tools/cleanup_runs.py. Каждая команда печатается перед запуском. Последняя
+tools/cleanup_runs.py. Диаризация стоит после распознавания: на CPU pyannote
+считает примерно в реальном времени, и на прогон без транскрипта эти десятки
+минут тратить незачем. Каждая команда печатается перед запуском. Последняя
 строка вывода — полный путь к итоговому .md.
 
 Коды возврата:
   0  итог собран, пунктуация восстановлена во всех окнах, саммари получено,
-     проверки таймкодов пройдены
-  1  итог собран, но есть пометки: нет саммари, есть окна с дословным текстом
-     или провалены проверки таймкодов
+     проверки таймкодов пройдены, ярлыки говорящих проставлены (или шаги
+     говорящих выключены флагом --no-diarize — это тоже код 0)
+  1  итог собран, но есть пометки: нет саммари, есть окна с дословным текстом,
+     провалены проверки таймкодов или не вышли говорящие — тогда расшифровка
+     идёт без ярлыков, а в документе стоит пометка с причиной
   2  расшифровку получить не удалось, итогового .md нет
 
 Примеры:
   bash scripts/transcribe_lecture.sh --input "vidio_example/Лекция 1.webm"
   bash scripts/transcribe_lecture.sh --input запись.mp4 --window 60 --no-chunks
+  bash scripts/transcribe_lecture.sh --input запись.mp4 --no-diarize
   bash scripts/transcribe_lecture.sh --from-transcript \
-      "data/output/Лекция 1-2026-10-03/transcript.json" --input "Лекция 1.webm"
+      "data/output/Лекция 1-2026-10-03/transcript.json" --input "Лекция 1.webm" \
+      --diarization "data/output/Лекция 1-2026-10-03/diarization.json"
 EOF
 }
 
@@ -193,6 +229,9 @@ while [ $# -gt 0 ]; do
       require_positive_int "--window" "$2"
       WINDOW="$2"
       shift 2 ;;
+    --no-diarize)      DIARIZE=0; shift ;;
+    --diarization)     [ $# -ge 2 ] || die "--diarization требует путь к diarization.json"
+                       DIARIZATION_IN="$2"; shift 2 ;;
     --keep-chunks)     KEEP_CHUNKS=1; shift ;;
     --no-chunks)       KEEP_CHUNKS=0; shift ;;
     --clean)           CLEAN=1; shift ;;
@@ -209,6 +248,30 @@ if [ -n "$FROM_TRANSCRIPT" ]; then
   [ -r "$FROM_TRANSCRIPT" ] || die "файл транскрипта недоступен для чтения: $FROM_TRANSCRIPT"
 else
   [ -n "$INPUT" ] || die "не задан --input: нужен медиафайл (см. --help)"
+fi
+
+if [ -n "$DIARIZATION_IN" ]; then
+  [ "$DIARIZE" -eq 1 ] \
+    || die "--no-diarize и --diarization вместе не имеют смысла: первый выключает говорящих, второй требует их посчитать"
+  [ -f "$DIARIZATION_IN" ] || die "не найден файл диаризации: $DIARIZATION_IN"
+  [ -r "$DIARIZATION_IN" ] || die "файл диаризации недоступен для чтения: $DIARIZATION_IN"
+fi
+
+# Шаги говорящих либо выполняются целиком, либо не выполняются вовсе, и решается
+# это здесь, до начала работы: от этого зависят и проверка наличия tools/*.py, и
+# предупреждение про время pyannote. Пропуск по просьбе («не надо» или «звука
+# уже нет») — это не пометка: такой прогон остаётся безупречным.
+SPEAKER_STEPS=1
+SKIP_REASON=""
+if [ "$DIARIZE" -eq 0 ]; then
+  SPEAKER_STEPS=0
+  SKIP_REASON="--no-diarize"
+elif [ -n "$FROM_TRANSCRIPT" ] && [ -z "$DIARIZATION_IN" ]; then
+  # Диаризации нужен звук, а при --from-transcript его нет: WAV не готовится, а
+  # исходной записи на машине может не быть вовсе. Готовый файл тут и подкладывают
+  # флагом --diarization — тогда фразы и роли считаются как обычно.
+  SPEAKER_STEPS=0
+  SKIP_REASON="--from-transcript без --diarization"
 fi
 
 # Существование входного файла проверяется только там, где его собираются
@@ -229,6 +292,12 @@ REQUIRED_TOOLS=(chunker transcribe outputs check_timecodes punctuate summarize r
 # а не в самом конце, когда убирать уже нечем.
 if [ "$CLEAN" -eq 1 ]; then
   REQUIRED_TOOLS+=(cleanup_runs)
+fi
+# Инструменты говорящих спрашиваются по тому же правилу: только когда эти шаги
+# будут. При --no-diarize и при --from-transcript без --diarization их никто не
+# позовёт, и обрывать из-за них прогон незачем.
+if [ "$SPEAKER_STEPS" -eq 1 ]; then
+  REQUIRED_TOOLS+=(diarize speakers roles)
 fi
 for tool in "${REQUIRED_TOOLS[@]}"; do
   [ -f "tools/$tool.py" ] \
@@ -254,8 +323,20 @@ fi
 # полчаса распознавания ради пометок «не получено».
 CLAUDE_NOTE="есть"
 if ! "$PY" tools/claude_cli.py --probe >/dev/null 2>&1; then
-  warn "claude в PATH не найден: расшифровка будет собрана, но без пунктуации и саммари, код возврата 1"
-  CLAUDE_NOTE="НЕТ — пунктуации и саммари не будет"
+  warn "claude в PATH не найден: расшифровка будет собрана, но без пунктуации, саммари и ролей говорящих (ярлыками станут «Говорящий N»), код возврата 1"
+  CLAUDE_NOTE="НЕТ — пунктуации, саммари и ролей не будет"
+fi
+
+# Диаризация — самый долгий шаг конвейера после распознавания, и человек должен
+# узнать об этом до того, как уйдёт пить чай на полчаса, а не после. Говорится
+# и про кэш: веса pyannote не скачиваются ни при каком раскладе.
+DIARIZE_NOTE="pyannote, устройство $DEVICE"
+if [ "$SPEAKER_STEPS" -eq 0 ]; then
+  DIARIZE_NOTE="выключена — $SKIP_REASON"
+elif [ -n "$DIARIZATION_IN" ]; then
+  DIARIZE_NOTE="готовый файл: $DIARIZATION_IN (pyannote не запускается)"
+else
+  warn "диаризация на CPU считает примерно в реальном времени: на записи 02:35:29 это десятки минут. Нужен заранее подготовленный локальный кэш pyannote — весов инструмент не скачивает; без кэша шаг вернёт код 2, документ соберётся без ярлыков говорящих, код возврата 1. Не нужны говорящие — --no-diarize; есть готовый файл — --diarization <путь>"
 fi
 
 # ------------------------------------------------------- имена и каталоги ---
@@ -331,7 +412,10 @@ TXT="$WORKDIR/transcript.txt"
 SRT="$WORKDIR/transcript.srt"
 CHECKS_JSON="$WORKDIR/checks.json"
 CHECKS_TXT="$WORKDIR/checks.txt"
+DIARIZATION="$WORKDIR/diarization.json"
 PUNCTUATED="$WORKDIR/punctuated.json"
+SPEAKERS="$WORKDIR/speakers.json"
+ROLES="$WORKDIR/roles.json"
 SUMMARY="$WORKDIR/summary.md"
 CLAUDE_LOGS="$WORKDIR/claude"
 LOG="$WORKDIR/run.log"
@@ -373,6 +457,7 @@ printf 'Рабочий кат.:  %s\n' "$WORKDIR"
 print_env_block "$DEVICE"
 printf '  claude:         %s\n' "$CLAUDE_NOTE"
 printf '  веса:           %s\n' "$WEIGHTS_NOTE"
+printf '  диаризация:     %s\n' "$DIARIZE_NOTE"
 
 if [ -n "$FROM_TRANSCRIPT" ]; then
   printf '\n== Готовый транскрипт (--from-transcript)\n'
@@ -509,7 +594,67 @@ else
   fi
 fi
 
-# ============================ 6. ПУНКТУАЦИЯ ============================
+# =========================== 6. ДИАРИЗАЦИЯ ===========================
+
+# Состояние шагов говорящих: DIARIZATION_OK говорит, есть ли годный
+# diarization.json; SPEAKERS_ARG и ROLES_ARG — файлы, которые уйдут в
+# summarize.py и render_doc.py; SPEAKERS_NOTE — причина, по которой ярлыков в
+# документе не будет. Пустая причина означает «ярлыки в порядке» или «шаги
+# пропущены по просьбе» — пометки в документе в обоих случаях нет.
+DIARIZATION_OK=0
+SPEAKERS_ARG=""
+ROLES_ARG=""
+SPEAKERS_NOTE=""
+
+if [ "$NO_DOC" -ne 0 ]; then
+  step "диаризация" "пропущено — нет расшифровки"
+elif [ "$SPEAKER_STEPS" -eq 0 ]; then
+  step "диаризация" "пропущено по просьбе — $SKIP_REASON"
+elif [ -n "$DIARIZATION_IN" ]; then
+  # Готовый файл переносится в рабочий подкаталог по той же причине, что и
+  # транскрипт при --from-transcript: итог и все его источники должны лежать
+  # вместе, иначе через месяц не восстановить, откуда в документе эти ярлыки.
+  printf '\n================ ГОТОВАЯ ДИАРИЗАЦИЯ ================\n'
+  copied=1
+  if [ "$(abs_path "$DIARIZATION_IN")" = "$(abs_path "$DIARIZATION")" ]; then
+    printf '  файл уже лежит в рабочем подкаталоге: %s\n' "$DIARIZATION"
+  else
+    printf '$ cp %s %s\n' "$DIARIZATION_IN" "$DIARIZATION"
+    cp "$DIARIZATION_IN" "$DIARIZATION" || copied=0
+  fi
+  if [ "$copied" -eq 1 ] && [ -s "$DIARIZATION" ]; then
+    DIARIZATION_OK=1
+    step "диаризация" "ок — готовый файл (--diarization $DIARIZATION_IN)"
+  else
+    # Не остановка: ярлыки — не вся расшифровка. Документ соберётся без них, с
+    # пометкой и кодом 1, как и при любой другой неудаче говорящих.
+    step "диаризация" "ПРОВАЛ — не удалось взять готовый файл $DIARIZATION_IN"
+    SPEAKERS_NOTE="не удалось взять готовый diarization.json: $DIARIZATION_IN"
+    FLAWED=1
+  fi
+else
+  printf '\n================ ДИАРИЗАЦИЯ ================\n'
+  printf '$ %s tools/diarize.py --input %s --out %s --device %s\n' \
+    "$PY" "$WAV" "$DIARIZATION" "$DEVICE"
+  rc=0
+  "$PY" tools/diarize.py --input "$WAV" --out "$DIARIZATION" --device "$DEVICE" || rc=$?
+  if [ "$rc" -ge 2 ] || [ ! -s "$DIARIZATION" ]; then
+    step "диаризация" "ПРОВАЛ — diarize.py вернул код $rc, файла нет"
+    SPEAKERS_NOTE="диаризация не удалась: tools/diarize.py вернул код $rc"
+    FLAWED=1
+  elif [ "$rc" -eq 1 ]; then
+    # Код 1 у diarize.py — файл записан, но говорящих ноль: речи не нашлось.
+    # Привязывать фразы не к кому, поэтому дальше шаги говорящих не идут.
+    step "диаризация" "РЕЧИ НЕ НАЙДЕНО — говорящих ноль (код $rc)"
+    SPEAKERS_NOTE="диаризация не нашла речи: говорящих ноль"
+    FLAWED=1
+  else
+    DIARIZATION_OK=1
+    step "диаризация" "ок — $DIARIZATION"
+  fi
+fi
+
+# ============================ 7. ПУНКТУАЦИЯ ============================
 
 if [ "$NO_DOC" -eq 0 ]; then
   printf '\n================ ПУНКТУАЦИЯ ================\n'
@@ -533,16 +678,95 @@ else
   step "пунктуация" "пропущено — нет расшифровки"
 fi
 
-# ============================== 7. САММАРИ ==============================
+# ==================== 8 и 9. ФРАЗЫ, ГОВОРЯЩИЕ И РОЛИ ====================
+
+# Оба шага идут одним блоком: роли считаются по фразам, и без speakers.json
+# звать roles.py нечем. Границы фраз берутся из абзацев пунктуации, поэтому
+# шаг стоит после неё, а не сразу за диаризацией.
+if [ "$NO_DOC" -ne 0 ]; then
+  step "фразы и говорящие" "пропущено — нет расшифровки"
+  step "роли"              "пропущено — нет расшифровки"
+elif [ "$SPEAKER_STEPS" -eq 0 ]; then
+  step "фразы и говорящие" "пропущено по просьбе — $SKIP_REASON"
+  step "роли"              "пропущено по просьбе — $SKIP_REASON"
+elif [ "$DIARIZATION_OK" -eq 0 ]; then
+  step "фразы и говорящие" "пропущено — годной диаризации нет"
+  step "роли"              "пропущено — годной диаризации нет"
+else
+  printf '\n================ ФРАЗЫ И ГОВОРЯЩИЕ ================\n'
+  printf '$ %s tools/speakers.py --transcript %s --punctuated %s --diarization %s --out %s\n' \
+    "$PY" "$TRANSCRIPT" "$PUNCTUATED" "$DIARIZATION" "$SPEAKERS"
+  rc=0
+  "$PY" tools/speakers.py --transcript "$TRANSCRIPT" --punctuated "$PUNCTUATED" \
+    --diarization "$DIARIZATION" --out "$SPEAKERS" || rc=$?
+  if [ "$rc" -ge 2 ] || [ ! -s "$SPEAKERS" ]; then
+    step "фразы и говорящие" "ПРОВАЛ — speakers.py вернул код $rc, фраз нет"
+    step "роли"              "пропущено — фраз с говорящими нет"
+    SPEAKERS_NOTE="привязка говорящих не удалась: tools/speakers.py вернул код $rc"
+    FLAWED=1
+  else
+    # Код 1 у speakers.py — файл годен, но в нём есть фразы без говорящего или
+    # невыровненные предложения. Ярлыки всё равно будут (у таких фраз их просто
+    # нет), поэтому файл идёт дальше, а прогон помечается.
+    SPEAKERS_ARG="$SPEAKERS"
+    if [ "$rc" -eq 1 ]; then
+      step "фразы и говорящие" "С ПОМЕТКАМИ — есть фразы без говорящего или невыровненные предложения (код $rc)"
+      FLAWED=1
+    else
+      step "фразы и говорящие" "ок — $SPEAKERS"
+    fi
+
+    printf '\n================ РОЛИ ГОВОРЯЩИХ ================\n'
+    printf '$ %s tools/roles.py --speakers %s --out %s --log-dir %s\n' \
+      "$PY" "$SPEAKERS" "$ROLES" "$CLAUDE_LOGS"
+    rc=0
+    "$PY" tools/roles.py --speakers "$SPEAKERS" --out "$ROLES" \
+      --log-dir "$CLAUDE_LOGS" || rc=$?
+    if [ "$rc" -ge 2 ] || [ ! -s "$ROLES" ]; then
+      # Неудача любого из трёх шагов — это документ без ярлыков целиком:
+      # --speakers без --roles дал бы расшифровку с «Говорящий N» вместо ролей,
+      # а это ровно тот случай, который roles.py закрывает своим кодом 1.
+      step "роли" "ПРОВАЛ — roles.py вернул код $rc, файла нет"
+      SPEAKERS_ARG=""
+      SPEAKERS_NOTE="роли говорящих определить не удалось: tools/roles.py вернул код $rc"
+      FLAWED=1
+    else
+      ROLES_ARG="$ROLES"
+      if [ "$rc" -eq 1 ]; then
+        step "роли" "ОТКАТ К ИМЕНАМ — ролей не вышло, ярлыками станут «Говорящий N» (код $rc)"
+        FLAWED=1
+      else
+        step "роли" "ок — $ROLES"
+      fi
+    fi
+  fi
+fi
+
+# Ярлыки идут в документ и в саммари только парой: имя говорящего без роли —
+# это и есть откат, о котором roles.py сообщает своим кодом 1.
+LABELS=0
+if [ -n "$SPEAKERS_ARG" ] && [ -n "$ROLES_ARG" ]; then
+  LABELS=1
+fi
+
+# ============================= 10. САММАРИ =============================
 
 SUMMARY_ARG=""
 if [ "$NO_DOC" -eq 0 ]; then
   printf '\n================ САММАРИ ================\n'
-  printf '$ %s tools/summarize.py --punctuated %s --out %s --log-dir %s\n' \
-    "$PY" "$PUNCTUATED" "$SUMMARY" "$CLAUDE_LOGS"
+  # Команда собирается массивом, а не шестью ветками печати и запуска: ярлыки
+  # добавляют к ней пару флагов, и держать оба списка в соответствии вручную —
+  # верный способ напечатать одно, а запустить другое.
+  SUMMARIZE_ARGS=(--punctuated "$PUNCTUATED")
+  if [ "$LABELS" -eq 1 ]; then
+    SUMMARIZE_ARGS+=(--speakers "$SPEAKERS_ARG" --roles "$ROLES_ARG")
+  fi
+  SUMMARIZE_ARGS+=(--out "$SUMMARY" --log-dir "$CLAUDE_LOGS")
+  printf '$ %s tools/summarize.py' "$PY"
+  printf ' %s' "${SUMMARIZE_ARGS[@]}"
+  printf '\n'
   rc=0
-  "$PY" tools/summarize.py --punctuated "$PUNCTUATED" --out "$SUMMARY" \
-    --log-dir "$CLAUDE_LOGS" || rc=$?
+  "$PY" tools/summarize.py "${SUMMARIZE_ARGS[@]}" || rc=$?
   if [ "$rc" -ge 2 ] || [ ! -s "$SUMMARY" ]; then
     # Файла нет вовсе — в документ пойдёт пометка «не получено» от render_doc,
     # поэтому --summary ему не передаём.
@@ -561,23 +785,29 @@ else
   step "саммари" "пропущено — нет пунктуации"
 fi
 
-# ========================= 8. ИТОГОВЫЙ ДОКУМЕНТ =========================
+# ======================== 11. ИТОГОВЫЙ ДОКУМЕНТ ========================
 
 if [ "$NO_DOC" -eq 0 ]; then
   printf '\n================ ИТОГОВЫЙ ДОКУМЕНТ ================\n'
+  RENDER_ARGS=(--punctuated "$PUNCTUATED")
   if [ -n "$SUMMARY_ARG" ]; then
-    printf '$ %s tools/render_doc.py --punctuated %s --summary %s --out %s --title %s\n' \
-      "$PY" "$PUNCTUATED" "$SUMMARY_ARG" "$DOC" "$BASE"
-    rc=0
-    "$PY" tools/render_doc.py --punctuated "$PUNCTUATED" --summary "$SUMMARY_ARG" \
-      --out "$DOC" --title "$BASE" || rc=$?
-  else
-    printf '$ %s tools/render_doc.py --punctuated %s --out %s --title %s\n' \
-      "$PY" "$PUNCTUATED" "$DOC" "$BASE"
-    rc=0
-    "$PY" tools/render_doc.py --punctuated "$PUNCTUATED" \
-      --out "$DOC" --title "$BASE" || rc=$?
+    RENDER_ARGS+=(--summary "$SUMMARY_ARG")
   fi
+  if [ "$LABELS" -eq 1 ]; then
+    RENDER_ARGS+=(--speakers "$SPEAKERS_ARG" --roles "$ROLES_ARG")
+  fi
+  # Пометка ставится ровно тогда, когда ярлыков не будет из-за неудачи, а не
+  # из-за просьбы: при --no-diarize и при --from-transcript без --diarization
+  # причина пуста, и документ выглядит как до появления говорящих.
+  if [ -n "$SPEAKERS_NOTE" ]; then
+    RENDER_ARGS+=(--speakers-note "$SPEAKERS_NOTE")
+  fi
+  RENDER_ARGS+=(--out "$DOC" --title "$BASE")
+  printf '$ %s tools/render_doc.py' "$PY"
+  printf ' %s' "${RENDER_ARGS[@]}"
+  printf '\n'
+  rc=0
+  "$PY" tools/render_doc.py "${RENDER_ARGS[@]}" || rc=$?
   if [ "$rc" -ge 2 ] || [ ! -s "$DOC" ]; then
     step "итоговый документ" "ПРОВАЛ — render_doc.py вернул код $rc, файла нет"
     NO_DOC=1
@@ -606,7 +836,8 @@ done
 
 printf '\n== Файлы прогона\n'
 for name in audio.wav plan.json transcript.json transcript.txt transcript.srt \
-            checks.json checks.txt punctuated.json summary.md; do
+            checks.json checks.txt diarization.json punctuated.json \
+            speakers.json roles.json summary.md; do
   if [ -e "$WORKDIR/$name" ]; then
     printf '  %s/%s\n' "$WORKDIR" "$name"
   fi
@@ -622,7 +853,7 @@ if [ -d "$CLAUDE_LOGS" ]; then
 fi
 printf '  %s\n' "$LOG_NOTE"
 
-# ============================== 9. ЧИСТКА ==============================
+# ============================= 12. ЧИСТКА =============================
 
 # Место выбрано так: список «Файлы прогона» выше показывает подкаталог таким,
 # каким он был до чистки, а последней строкой вывода обязан остаться путь к
