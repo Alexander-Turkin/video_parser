@@ -8,6 +8,18 @@
   ## Саммари      — фрагмент вставляется как есть, без переформатирования;
   ## Расшифровка  — по строке на предложение, вида «[ЧЧ:ММ:СС] Текст.».
 
+Если переданы ещё два файла — speakers/1 (фразы с говорящими от tools/speakers.py)
+и, необязательно, roles/1 (соответствие «Говорящий N → роль» от tools/roles.py), —
+расшифровка собирается не по предложениям, а по фразам, и каждая строка получает
+ярлык говорящего: «[00:12:34] Преподаватель: фраза». Без --speakers ничего не
+меняется: документ выходит ровно таким же, как и до появления этих флагов.
+
+Диаризация — шаг необязательный и ненадёжный, поэтому её неудача документ не
+роняет: негодный speakers/1 или roles/1 даёт предупреждение в stderr, расшифровку
+предложениями без ярлыков, видимую пометку в документе и код возврата 1. Тем же
+кончается --speakers-note «<причина>» — им сборочный скрипт говорит, почему
+ярлыков не будет, когда до диаризации дело вовсе не дошло.
+
 Технического блока в документе нет сознательно: владелец решил, что модель, ×RT,
 SHA-256 входа, версии и длительность в итоговый файл не идут — они и так лежат в
 промежуточных JSON рядом с документом.
@@ -30,6 +42,8 @@ tools/outputs.py: там формат SRT (HH:MM:SS,mmm с округление�
 
 Использование:
   python tools/render_doc.py --punctuated <файл.json> --out <файл.md> [--summary <файл.md>]
+  python tools/render_doc.py --punctuated <файл.json> --speakers <файл.json> \
+      --roles <файл.json> --out <файл.md>
   python tools/render_doc.py --selftest
 """
 
@@ -47,6 +61,10 @@ from dataclasses import dataclass, field
 
 PROG = "render_doc.py"
 SCHEMA = "punctuated/1"
+
+# Необязательные входы: фразы с говорящими и соответствие «говорящий -> роль».
+SPEAKERS_SCHEMA = "speakers/1"
+ROLES_SCHEMA = "roles/1"
 
 # Заголовки разделов итогового документа. Больше в нём ничего нет.
 TITLE_SUMMARY = "## Саммари"
@@ -68,12 +86,27 @@ HELP = """Использование:
 пунктуация не восстановилась, помечены видимой строкой перед своим блоком.
 Ничего, кроме этих двух разделов, в документе нет.
 
+С --speakers расшифровка собирается не по предложениям, а по фразам говорящих, и
+каждая строка получает ярлык: «[ЧЧ:ММ:СС] Преподаватель: текст фразы.». Ярлык —
+это роль из файла --roles, а без него — имя говорящего («Говорящий 1»); у фразы,
+которой диаризация говорящего не дала, строка остаётся прежней, без ярлыка.
+
 Опции:
   --punctuated <файл>   JSON схемы punctuated/1 от tools/punctuate.py (обязателен)
   --out <файл>          куда записать итоговый .md (обязателен)
   --summary <файл>      markdown-фрагмент саммари от tools/summarize.py;
                         если не указан, не существует или пуст — вместо саммари
                         в документ идёт пометка «не получено»
+  --speakers <файл>     JSON схемы speakers/1 от tools/speakers.py: фразы с
+                        говорящими. С ним расшифровка идёт фразами с ярлыками,
+                        без него — предложениями, как и раньше
+  --roles <файл>        JSON схемы roles/1 от tools/roles.py: соответствие
+                        «Говорящий N → роль». Без него ярлыком служит имя
+                        говорящего; без --speakers файл не используется
+  --speakers-note <текст>
+                        причина, по которой ярлыков говорящих не будет (например,
+                        «диаризация не запускалась»). Ставит видимую пометку под
+                        заголовком «## Расшифровка» и даёт код возврата 1
   --title <строка>      заголовок документа; по умолчанию — имя исходной записи
                         без расширения из поля source файла punctuated
   --selftest            прогнать встроенные проверки и выйти
@@ -81,15 +114,23 @@ HELP = """Использование:
 
 Каталог для --out создаётся при необходимости, файл пишется в UTF-8.
 
+Негодный speakers/1 или roles/1 (чужая схема, битый JSON, фразы не покрывают
+предложения) документ не роняет: причина уходит в stderr, расшифровка собирается
+предложениями без ярлыков, в документе появляется видимая пометка, код 1.
+
 Коды возврата:
   0  документ записан, пометок в нём нет
-  1  документ записан, но в нём есть пометки (нет саммари или окна в откате)
+  1  документ записан, но в нём есть пометки (нет саммари, окна в откате или
+     не проставлены ярлыки говорящих)
   2  вход непригоден (нет файла, не та схема, нет предложений) — --out не создаётся
 
 Примеры:
   python tools/render_doc.py --punctuated data/output/лекция/punctuated.json \\
       --summary data/output/лекция/summary.md --out "data/output/лекция-2026-10-03.md"
-  python tools/render_doc.py --punctuated p.json --out doc.md --title "Созвон команды"
+  python tools/render_doc.py --punctuated p.json --speakers speakers.json \\
+      --roles roles.json --summary summary.md --out doc.md
+  python tools/render_doc.py --punctuated p.json --out doc.md \\
+      --speakers-note "диаризация не запускалась (--no-diarize)"
 """
 
 
@@ -99,6 +140,16 @@ class UsageError(Exception):
 
 class DocumentError(Exception):
     """Вход не читается, не той схемы или в нём нет нужных полей."""
+
+
+class SpeakersError(Exception):
+    """Негодный speakers/1 или roles/1 — ярлыков не будет, но документ будет.
+
+    Отдельный тип, а не наследник DocumentError, именно поэтому: DocumentError в
+    main() означает «документ не собран, код 2», а беда с говорящими такого права
+    не имеет. Расшифровка — главное содержимое прогона, и терять её из-за
+    необязательного шага нельзя.
+    """
 
 
 def die(message: str, code: int = 2) -> int:
@@ -498,6 +549,303 @@ def load_punctuated(path: str) -> Punctuated:
     return parse_punctuated(data, path=path)
 
 
+# ------------------------------------------------- говорящие и их ярлыки ---
+
+
+@dataclass
+class Phrase:
+    """Фраза одного говорящего из speakers/1.
+
+    sentences — границы [первое, последнее] по сквозной нумерации предложений
+    punctuated/1: по ним фраза привязывается к окну пунктуации, а значит, и к
+    пометке об откате. speaker — имя от диаризации («Говорящий 1») или None,
+    если кусок записи ей не достался.
+    """
+
+    index: int
+    start: float
+    end: float
+    text: str
+    speaker: str | None
+    first_sentence: int
+    last_sentence: int
+    paragraph: int | None
+
+
+@dataclass
+class Speakers:
+    """То, что инструменту нужно от speakers.json: фразы по порядку и имена."""
+
+    path: str
+    names: list[str]
+    phrases: list[Phrase]
+
+
+def _speaker_field(holder: dict, key: str, where: str, reader) -> object:
+    """Читает поле чужой схемы теми же проверками, что и поля punctuated/1.
+
+    Разница только в типе исключения: беда в speakers/1 и roles/1 не должна
+    приводить к коду 2, поэтому DocumentError переводится в SpeakersError.
+    """
+    try:
+        return reader(holder, key, where)
+    except DocumentError as exc:
+        raise SpeakersError(str(exc)) from None
+
+
+def _check_foreign_schema(data: object, schema: str) -> dict:
+    """Общая для speakers/1 и roles/1 проверка верхнего уровня."""
+    if not isinstance(data, dict):
+        raise SpeakersError(
+            "на верхнем уровне ожидается объект JSON, получено: %s" % _typename(data)
+        )
+    if "schema" not in data:
+        raise SpeakersError("в файле нет поля schema (ожидается %r)" % schema)
+    if data["schema"] != schema:
+        raise SpeakersError(
+            "не та схема: ожидается %r, в файле %r" % (schema, data["schema"])
+        )
+    return data
+
+
+def _parse_speaker_names(data: dict) -> list[str]:
+    """Имена говорящих из поля speakers. Для рендера необязательны.
+
+    Ярлык строки берётся из самой фразы, поэтому список нужен ровно для одного:
+    заметить рассогласование файла (во фразах есть тот, кого нет в списке) и
+    сказать об этом человеку, не ломая документ.
+    """
+    entries = data.get("speakers")
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise SpeakersError(
+            "поле speakers должно быть списком, получено: %s" % _typename(entries)
+        )
+    names: list[str] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise SpeakersError(
+                "говорящий №%d должен быть объектом JSON, получено: %s"
+                % (position + 1, _typename(entry))
+            )
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SpeakersError(
+                "говорящий №%d: поле name должно быть непустой строкой" % (position + 1)
+            )
+        names.append(" ".join(name.split()))
+    return names
+
+
+def _parse_phrase_speaker(raw: object, where: str) -> str | None:
+    """Имя говорящего фразы: строка, либо None — «диаризация его не дала»."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise SpeakersError(
+            "%s: поле speaker должно быть строкой или null, получено: %s"
+            % (where, _typename(raw))
+        )
+    name = " ".join(raw.split())
+    return name or None
+
+
+def _parse_phrase_bounds(raw: object, where: str) -> tuple[int, int]:
+    """Границы фразы по предложениям punctuated/1 — [первое, последнее]."""
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise SpeakersError(
+            "%s: поле sentences должно быть списком из двух номеров предложений" % where
+        )
+    first = _as_index(raw[0])
+    last = _as_index(raw[1])
+    if first is None or last is None:
+        raise SpeakersError("%s: границы фразы должны быть целыми числами" % where)
+    if last < first:
+        raise SpeakersError(
+            "%s: конец диапазона предложений раньше начала (%d и %d)"
+            % (where, first, last)
+        )
+    return first, last
+
+
+def parse_speakers(data: object, path: str = "<память>") -> Speakers:
+    """Проверяет структуру JSON схемы speakers/1 и приводит её к Speakers.
+
+    Проверяется то, без чего ярлыки не поставить: схема, фразы с текстом,
+    временем, именем говорящего и границами по предложениям. Качество самой
+    диаризации — не дело этого инструмента.
+    """
+    data = _check_foreign_schema(data, SPEAKERS_SCHEMA)
+    names = _parse_speaker_names(data)
+
+    if "phrases" not in data:
+        raise SpeakersError("в файле нет поля phrases")
+    raw_phrases = data["phrases"]
+    if not isinstance(raw_phrases, list):
+        raise SpeakersError(
+            "поле phrases должно быть списком, получено: %s" % _typename(raw_phrases)
+        )
+    if not raw_phrases:
+        raise SpeakersError("список phrases пуст — расшифровку по фразам не собрать")
+
+    phrases: list[Phrase] = []
+    for position, raw in enumerate(raw_phrases):
+        where = "фраза №%d" % (position + 1)
+        if not isinstance(raw, dict):
+            raise SpeakersError(
+                "%s должна быть объектом JSON, получено: %s" % (where, _typename(raw))
+            )
+        index = _as_index(raw.get("index"))
+        if index is None:
+            index = position
+        else:
+            where = "фраза index=%d" % index
+
+        start = float(_speaker_field(raw, "start", where, _as_number))
+        if start < 0:
+            raise SpeakersError(
+                "%s: start меньше нуля (%s) — таймкод считается от начала записи"
+                % (where, start)
+            )
+        end = float(_speaker_field(raw, "end", where, _as_number)) if "end" in raw else start
+        text = " ".join(str(_speaker_field(raw, "text", where, _as_text)).split())
+        if not text:
+            # Пустую фразу нельзя просто выбросить, как пустое предложение: за
+            # ней закреплены предложения punctuated/1, и их текст тогда пропал
+            # бы из документа совсем. Такой вход негоден целиком.
+            raise SpeakersError("%s: пустой текст — предложения фразы потерялись бы" % where)
+
+        first, last = _parse_phrase_bounds(raw.get("sentences"), where)
+        phrases.append(
+            Phrase(
+                index=index,
+                start=start,
+                end=max(start, end),
+                text=text,
+                speaker=_parse_phrase_speaker(raw.get("speaker"), where),
+                first_sentence=first,
+                last_sentence=last,
+                paragraph=_as_index(raw.get("paragraph")),
+            )
+        )
+
+    if names:
+        unknown = sorted(
+            {
+                phrase.speaker
+                for phrase in phrases
+                if phrase.speaker is not None and phrase.speaker not in names
+            }
+        )
+        if unknown:
+            warn(
+                "в phrases есть говорящие, которых нет в списке speakers: %s"
+                % ", ".join(unknown)
+            )
+    return Speakers(path=path, names=names, phrases=phrases)
+
+
+def _load_foreign_json(path: str, what: str) -> object:
+    """Читает необязательный входной файл. Любая беда — SpeakersError."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        raise SpeakersError("файл %s не найден: %s" % (what, path)) from None
+    except IsADirectoryError:
+        raise SpeakersError("вместо файла %s указан каталог: %s" % (what, path)) from None
+    except PermissionError:
+        raise SpeakersError("файл %s недоступен для чтения: %s" % (what, path)) from None
+    except UnicodeDecodeError:
+        raise SpeakersError("файл %s не в кодировке UTF-8: %s" % (what, path)) from None
+    except json.JSONDecodeError as exc:
+        raise SpeakersError(
+            "файл %s не разбирается как JSON: %s (строка %d, символ %d: %s)"
+            % (what, path, exc.lineno, exc.colno, exc.msg)
+        ) from None
+    except OSError as exc:
+        raise SpeakersError(
+            "не удалось прочитать файл %s: %s (%s)" % (what, path, exc.strerror or exc)
+        ) from None
+
+
+def load_speakers(path: str) -> Speakers:
+    """Читает speakers.json схемы speakers/1.
+
+    Имя функции зафиксировано планом: tools/summarize.py импортирует её отсюда,
+    чтобы разбор speakers/1 жил в проекте в одном месте.
+    """
+    return parse_speakers(_load_foreign_json(path, SPEAKERS_SCHEMA), path=path)
+
+
+def parse_roles(data: object, path: str = "<память>") -> dict[str, str]:
+    """Проверяет структуру JSON схемы roles/1 и отдаёт «имя говорящего -> роль».
+
+    Статус файла (ok, fallback, skip) здесь не проверяется: при fallback роли
+    равны именам, при skip список пуст, и в обоих случаях ярлыки получаются
+    правильные сами собой. Решение «звать ли claude ещё раз» принимает не этот
+    инструмент.
+    """
+    data = _check_foreign_schema(data, ROLES_SCHEMA)
+
+    if "roles" not in data:
+        raise SpeakersError("в файле нет поля roles")
+    entries = data["roles"]
+    if not isinstance(entries, list):
+        raise SpeakersError(
+            "поле roles должно быть списком, получено: %s" % _typename(entries)
+        )
+
+    roles: dict[str, str] = {}
+    for position, entry in enumerate(entries):
+        where = "роль №%d" % (position + 1)
+        if not isinstance(entry, dict):
+            raise SpeakersError(
+                "%s должна быть объектом JSON, получено: %s" % (where, _typename(entry))
+            )
+        speaker = entry.get("speaker")
+        if not isinstance(speaker, str) or not speaker.strip():
+            raise SpeakersError("%s: поле speaker должно быть непустой строкой" % where)
+        role = entry.get("role")
+        if not isinstance(role, str) or not role.strip():
+            raise SpeakersError("%s: поле role должно быть непустой строкой" % where)
+        speaker = " ".join(speaker.split())
+        if speaker in roles:
+            # Две роли у одного говорящего — непонятно, какую печатать в строке.
+            raise SpeakersError("%s: говорящий %s встречается дважды" % (where, speaker))
+        roles[speaker] = " ".join(role.split())
+    return roles
+
+
+def load_roles(path: str) -> dict[str, str]:
+    """Читает roles.json схемы roles/1. Имя функции зафиксировано планом."""
+    return parse_roles(_load_foreign_json(path, ROLES_SCHEMA), path=path)
+
+
+def speaker_label(phrase: object, roles: dict[str, str] | None) -> str | None:
+    """Ярлык строки расшифровки: роль, иначе имя говорящего, иначе None.
+
+    None означает «ярлыка нет»: у фразы, которой диаризация говорящего не дала,
+    строка остаётся прежней — «[ЧЧ:ММ:СС] текст», без двоеточия и пустого места
+    перед ним.
+
+    Фраза принимается и объектом Phrase, и словарём прямо из JSON: читателям
+    speakers/1 (сейчас — tools/summarize.py) удобно звать функцию и так, и так.
+    """
+    raw = phrase.get("speaker") if isinstance(phrase, dict) else getattr(phrase, "speaker", None)
+    if not isinstance(raw, str):
+        return None
+    name = " ".join(raw.split())
+    if not name:
+        return None
+    if roles:
+        role = roles.get(name)
+        if role:
+            return role
+    return name
+
+
 def read_summary(path: str | None) -> tuple[str, str | None]:
     """Читает фрагмент саммари. Возвращает (текст, что сказать в stderr).
 
@@ -545,15 +893,21 @@ def read_summary(path: str | None) -> tuple[str, str | None]:
 class Stats:
     """Чем закончилась сборка — это же уходит в отчёт и в код возврата."""
 
-    sentences: int = 0
+    lines: int = 0
     paragraphs: int = 0
     fallback_windows: list[int] = field(default_factory=list)
     summary_missing: bool = False
+    speakers_note: str | None = None
+    by_phrases: bool = False
 
     @property
     def marks(self) -> int:
         """Сколько пометок видно в документе."""
-        return len(self.fallback_windows) + (1 if self.summary_missing else 0)
+        return (
+            len(self.fallback_windows)
+            + (1 if self.summary_missing else 0)
+            + (1 if self.speakers_note else 0)
+        )
 
 
 def default_title(source: str, out: str) -> str:
@@ -592,33 +946,150 @@ def render_fallback_mark(window: Window | None, index: int | None) -> str:
     )
 
 
+def render_speakers_mark(reason: str) -> str:
+    """Строка-пометка под заголовком расшифровки: ярлыков говорящих не будет.
+
+    Та же markdown-цитата, что и у пометки об откате пунктуации, и по той же
+    причине: читатель должен видеть, что строки идут без имён не потому, что
+    говорил один человек.
+    """
+    text = (reason or "").strip().rstrip(".") or "причина не указана"
+    return "> ⚠️ Ярлыки говорящих не проставлены: %s." % text
+
+
 def render_sentence(sentence: Sentence) -> str:
     """Предложение -> строка «[ЧЧ:ММ:СС] текст»."""
     return "[%s] %s" % (format_timecode(sentence.start), sentence.text)
 
 
-def _is_fallback(paragraph: Paragraph, windows: dict[int, Window]) -> bool:
-    """Нужна ли пометка перед этим абзацем.
+def render_phrase(phrase: Phrase, roles: dict[str, str] | None) -> str:
+    """Фраза -> строка «[ЧЧ:ММ:СС] Ярлык: текст», а без говорящего — без ярлыка."""
+    label = speaker_label(phrase, roles)
+    if label is None:
+        return "[%s] %s" % (format_timecode(phrase.start), phrase.text)
+    return "[%s] %s: %s" % (format_timecode(phrase.start), label, phrase.text)
+
+
+@dataclass
+class Block:
+    """Абзац расшифровки: готовые строки и окна пунктуации, из которых он собран.
+
+    Окон у абзаца обычно одно, но список, а не число: фразы speakers/1 нарезаны
+    по речи, а не по окнам пунктуации, и абзац из них может задеть границу окон.
+    Пометка об откате тогда встанет перед всем абзацем — раньше, чем начинается
+    откатившееся окно, но зато не потеряется.
+    """
+
+    windows: list[int | None]
+    fallback_hint: bool
+    lines: list[str]
+
+
+def _is_fallback(window_index: int | None, windows: dict[int, Window], hint: bool) -> bool:
+    """Нужна ли пометка об откате для этого окна.
 
     Истина окна — поле status в windows. Флаг fallback у предложений работает
     страховкой: если списка окон в файле нет, пометку всё равно надо поставить.
     """
-    window = windows.get(paragraph.window) if paragraph.window is not None else None
+    window = windows.get(window_index) if window_index is not None else None
     if window is not None:
         return window.fallback
-    return any(sentence.fallback for sentence in paragraph.sentences)
+    return hint
+
+
+def build_sentence_blocks(data: Punctuated) -> list[Block]:
+    """Расшифровка предложениями — то, как документ собирался до говорящих."""
+    blocks: list[Block] = []
+    for paragraph in data.paragraphs:
+        if not paragraph.sentences:
+            continue
+        blocks.append(
+            Block(
+                windows=[paragraph.window],
+                fallback_hint=any(sentence.fallback for sentence in paragraph.sentences),
+                lines=[render_sentence(sentence) for sentence in paragraph.sentences],
+            )
+        )
+    return blocks
+
+
+def build_phrase_blocks(
+    data: Punctuated, speakers: Speakers, roles: dict[str, str] | None
+) -> list[Block]:
+    """Расшифровка фразами с ярлыками. Негодный speakers/1 — SpeakersError.
+
+    Фразы обязаны идти по порядку, не перекрываться и покрывать все предложения
+    punctuated/1: иначе часть расшифровки просто исчезла бы из документа, а это
+    хуже, чем документ без ярлыков. Границы абзацев берутся из поля paragraph
+    фраз, окно пунктуации — у предложений, которые фраза собой закрывает.
+    """
+    by_index = {sentence.index: sentence for sentence in data.sentences}
+    covered: set[int] = set()
+    previous_last: int | None = None
+    missing_paragraph = False
+
+    blocks: list[Block] = []
+    current_key: object = object()  # заведомо не равно ни одному номеру абзаца
+    for phrase in speakers.phrases:
+        if previous_last is not None and phrase.first_sentence <= previous_last:
+            raise SpeakersError(
+                "фраза index=%d: предложения %d–%d перекрывают предыдущую фразу "
+                "или идут не по порядку"
+                % (phrase.index, phrase.first_sentence, phrase.last_sentence)
+            )
+        previous_last = phrase.last_sentence
+
+        sentences = [
+            by_index[number]
+            for number in range(phrase.first_sentence, phrase.last_sentence + 1)
+            if number in by_index
+        ]
+        covered.update(sentence.index for sentence in sentences)
+        window = sentences[0].window if sentences else None
+        hint = any(sentence.fallback for sentence in sentences)
+
+        if phrase.paragraph is None:
+            missing_paragraph = True
+        key = phrase.paragraph
+        if not blocks or key != current_key:
+            current_key = key
+            blocks.append(Block(windows=[], fallback_hint=False, lines=[]))
+        block = blocks[-1]
+        if window not in block.windows:
+            block.windows.append(window)
+        block.fallback_hint = block.fallback_hint or hint
+        block.lines.append(render_phrase(phrase, roles))
+
+    if missing_paragraph:
+        warn("у части фраз нет поля paragraph — такие фразы идут одним абзацем")
+
+    lost = sorted(number for number in by_index if number not in covered)
+    if lost:
+        raise SpeakersError(
+            "фразы не покрывают %d предложений punctuated/1 (например, index=%d)"
+            % (len(lost), lost[0])
+        )
+    if not blocks:
+        raise SpeakersError("из фраз не собралось ни одного абзаца расшифровки")
+    return blocks
 
 
 def render_document(
-    data: Punctuated, title: str, summary: str, summary_path: str | None
+    data: Punctuated,
+    title: str,
+    summary: str,
+    summary_path: str | None,
+    body: list[Block],
+    speakers_note: str | None = None,
 ) -> tuple[str, Stats]:
     """Собирает текст итогового документа и статистику по нему.
 
     Документ — это список блоков, склеенных одной пустой строкой: заголовок,
-    «## Саммари», фрагмент саммари, «## Расшифровка» и дальше по два блока на
-    абзац (пометка, если окно в откате, и сами строки предложений).
+    «## Саммари», фрагмент саммари, «## Расшифровка», пометка об отсутствии
+    ярлыков (если она нужна) и дальше по два блока на абзац (пометка, если окно
+    в откате, и сами строки расшифровки).
     """
-    stats = Stats()
+    stats = Stats(speakers_note=speakers_note)
     blocks: list[str] = ["# %s" % title.strip(), TITLE_SUMMARY]
 
     if summary.strip():
@@ -634,30 +1105,70 @@ def render_document(
         blocks.append("%s\n\n%s" % (SUMMARY_FIRST_SECTION, missing))
 
     blocks.append(TITLE_BODY)
+    if speakers_note:
+        blocks.append(render_speakers_mark(speakers_note))
 
     marked: set[int | None] = set()
-    for paragraph in data.paragraphs:
-        if not paragraph.sentences:
+    for block in body:
+        if not block.lines:
             continue
-        if _is_fallback(paragraph, data.windows) and paragraph.window not in marked:
-            # Одно окно — одна пометка, даже если абзацев в нём несколько.
-            marked.add(paragraph.window)
-            window = (
-                data.windows.get(paragraph.window)
-                if paragraph.window is not None
-                else None
-            )
-            blocks.append(render_fallback_mark(window, paragraph.window))
+        for number in block.windows:
+            if not _is_fallback(number, data.windows, block.fallback_hint):
+                continue
+            if number in marked:
+                # Одно окно — одна пометка, даже если абзацев в нём несколько.
+                continue
+            marked.add(number)
+            window = data.windows.get(number) if number is not None else None
+            blocks.append(render_fallback_mark(window, number))
             stats.fallback_windows.append(
-                window.index if window is not None else (paragraph.window or 0)
+                window.index if window is not None else (number or 0)
             )
-        blocks.append(
-            "\n".join(render_sentence(sentence) for sentence in paragraph.sentences)
-        )
+        blocks.append("\n".join(block.lines))
         stats.paragraphs += 1
-        stats.sentences += len(paragraph.sentences)
+        stats.lines += len(block.lines)
 
     return "\n\n".join(blocks) + "\n", stats
+
+
+def build_body(data: Punctuated, opts: dict) -> tuple[list[Block], str | None, bool]:
+    """Решает, из чего собирать расшифровку: из фраз с ярлыками или из предложений.
+
+    Возвращает блоки расшифровки, причину отсутствия ярлыков (её увидит читатель
+    документа) и признак «собрано фразами» — он нужен только отчёту в stdout.
+
+    Правило одно: расшифровка выходит в любом случае. Негодный speakers/1 или
+    roles/1 стоит ярлыков, но не строк, поэтому его беда становится пометкой в
+    документе и кодом возврата 1, а не ошибкой прогона.
+    """
+    note = opts["speakers_note"].strip() if opts["speakers_note"] else None
+    if opts["roles"] and not opts["speakers"]:
+        warn("--roles без --speakers не используется: ярлыки берутся из фраз speakers/1")
+    if note and opts["speakers"]:
+        # Явная причина от вызывающего сильнее файла: раз он говорит, что
+        # ярлыков не будет, ставить их в половину строк — врать читателю.
+        warn(
+            "--speakers-note задан вместе с --speakers: файл %s не читается, "
+            "ярлыки не проставляются" % opts["speakers"]
+        )
+
+    if opts["speakers"] and not note:
+        try:
+            speakers = load_speakers(opts["speakers"])
+            roles = load_roles(opts["roles"]) if opts["roles"] else None
+            if roles and speakers.names and not any(name in roles for name in speakers.names):
+                # Не беда файла, а рассогласование двух файлов: ярлыками станут
+                # имена говорящих, и это лучше, чем документ без ярлыков вовсе.
+                warn(
+                    "ни одна роль из %s не совпала с именами говорящих — "
+                    "ярлыками будут имена" % opts["roles"]
+                )
+            return build_phrase_blocks(data, speakers, roles), None, True
+        except SpeakersError as exc:
+            warn(str(exc))
+            note = str(exc)
+
+    return build_sentence_blocks(data), note, False
 
 
 def write_text_file(path: str, content: str) -> None:
@@ -685,11 +1196,16 @@ def print_report(path: str, size: int, stats: Stats) -> None:
     sys.stdout.write("================ ИТОГОВЫЙ ДОКУМЕНТ ================\n")
     sys.stdout.write("Файл:          %s\n" % path)
     sys.stdout.write("Размер:        %d байт\n" % size)
-    sys.stdout.write("Предложений:   %d\n" % stats.sentences)
+    if stats.by_phrases:
+        sys.stdout.write("Фраз:          %d\n" % stats.lines)
+    else:
+        sys.stdout.write("Предложений:   %d\n" % stats.lines)
     sys.stdout.write("Абзацев:       %d\n" % stats.paragraphs)
     sys.stdout.write("Пометок:       %d\n" % stats.marks)
     if stats.summary_missing:
         sys.stdout.write("  * саммари не получено\n")
+    if stats.speakers_note:
+        sys.stdout.write("  * ярлыки говорящих не проставлены: %s\n" % stats.speakers_note)
     if stats.fallback_windows:
         sys.stdout.write(
             "  * пунктуация не восстановлена в окнах: %s\n"
@@ -702,9 +1218,16 @@ def print_report(path: str, size: int, stats: Stats) -> None:
 _FLAGS_VALUE = {
     "--punctuated": "punctuated",
     "--summary": "summary",
+    "--speakers": "speakers",
+    "--roles": "roles",
+    "--speakers-note": "speakers_note",
     "--out": "out",
     "--title": "title",
 }
+
+# Флаги, значение которых — не путь, а произвольный текст: пустым для них
+# считается и значение из одних пробелов.
+_FLAGS_TEXT = ("--title", "--speakers-note")
 
 
 def parse_args(argv: list[str]) -> dict:
@@ -716,6 +1239,9 @@ def parse_args(argv: list[str]) -> dict:
     opts: dict = {
         "punctuated": None,
         "summary": None,
+        "speakers": None,
+        "roles": None,
+        "speakers_note": None,
         "out": None,
         "title": None,
         "help": False,
@@ -745,10 +1271,11 @@ def parse_args(argv: list[str]) -> dict:
             else:
                 value = inline
                 position += 1
-            # --title принимает любую строку, остальные флаги — путь; пустое
-            # значение в обоих случаях бессмысленно. У заголовка пустым считается
-            # и текст из одних пробелов: в документ он уйдёт обрезанным.
-            empty = not value.strip() if token == "--title" else not value
+            # --title и --speakers-note принимают любую строку, остальные флаги
+            # — путь; пустое значение в обоих случаях бессмысленно. У текстовых
+            # флагов пустым считается и текст из одних пробелов: в документ он
+            # уйдёт обрезанным.
+            empty = not value.strip() if token in _FLAGS_TEXT else not value
             if empty:
                 raise UsageError("%s требует непустое значение" % token)
             opts[_FLAGS_VALUE[token]] = value
@@ -773,8 +1300,12 @@ def check_args(opts: dict) -> None:
     # заново punctuated.json нечем: он стоит двух часов распознавания.
     if out == os.path.abspath(opts["punctuated"]):
         raise UsageError("--out указывает на тот же файл, что и --punctuated: %s" % opts["out"])
-    if opts["summary"] and out == os.path.abspath(opts["summary"]):
-        raise UsageError("--out указывает на тот же файл, что и --summary: %s" % opts["out"])
+    for flag in ("--summary", "--speakers", "--roles"):
+        value = opts[_FLAGS_VALUE[flag]]
+        if value and out == os.path.abspath(value):
+            raise UsageError(
+                "--out указывает на тот же файл, что и %s: %s" % (flag, opts["out"])
+            )
 
 
 # ---------------------------------------------------------------- селф-тест ---
@@ -788,6 +1319,13 @@ MARK_RE = re.compile(
     r"^> ⚠️ Пунктуация не восстановлена \((?P<where>[^()]+)\): (?P<reason>.+)\. "
     r"Ниже — дословный текст модели\.$"
 )
+
+# Пометка об отсутствии ярлыков говорящих — она же стоит под «## Расшифровка».
+NOTE_RE = re.compile(r"^> ⚠️ Ярлыки говорящих не проставлены: (?P<reason>.+)\.$")
+
+# Разбор строки расшифровки на ярлык и текст. Двоеточие внутри самого текста в
+# проверочных фразах не встречается, поэтому разделитель однозначен.
+LABEL_RE = re.compile(r"^(?P<label>[^:]+): (?P<text>.+)$")
 
 # Слова технического блока: ни одного из них в документе быть не должно.
 TECH_WORDS = ("×RT", "SHA-256", "sha256", "source_duration", "v3_rnnt", "torch")
@@ -806,6 +1344,7 @@ class ParsedDoc:
     summary: list[str]
     marks: list[str]
     paragraphs: list[list[tuple[int, str]]]  # (секунды, текст) по строкам абзаца
+    notes: list[str] = field(default_factory=list)  # пометки об отсутствии ярлыков
 
 
 def parse_document(text: str) -> ParsedDoc:
@@ -837,6 +1376,7 @@ def parse_document(text: str) -> ParsedDoc:
     )
 
     marks: list[str] = []
+    notes: list[str] = []
     paragraphs: list[list[tuple[int, str]]] = []
     current: list[tuple[int, str]] = []
     for line in lines[body_at + 1:]:
@@ -847,6 +1387,13 @@ def parse_document(text: str) -> ParsedDoc:
             continue
         if line.startswith(">"):
             _check(not current, "пометка внутри абзаца, а не перед ним: %r" % line)
+            if NOTE_RE.match(line) is not None:
+                _check(
+                    not notes and not marks and not paragraphs,
+                    "пометка о ярлыках стоит не сразу под заголовком расшифровки: %r" % line,
+                )
+                notes.append(line)
+                continue
             _check(MARK_RE.match(line) is not None, "пометка не того вида: %r" % line)
             marks.append(line)
             continue
@@ -859,7 +1406,9 @@ def parse_document(text: str) -> ParsedDoc:
         paragraphs.append(current)
 
     _check(paragraphs, "в разделе расшифровки нет ни одного абзаца")
-    return ParsedDoc(title=title, summary=summary, marks=marks, paragraphs=paragraphs)
+    return ParsedDoc(
+        title=title, summary=summary, marks=marks, paragraphs=paragraphs, notes=notes
+    )
 
 
 def _fixture_summary() -> str:
@@ -944,6 +1493,110 @@ def _fixture_punctuated(*, fallback: bool = False) -> dict:
     }
 
 
+def _fixture_speakers(*, fallback: bool = False) -> dict:
+    """Файл схемы speakers/1 под тот же punctuated: фразы покрывают предложения.
+
+    Пять фраз на шесть предложений, три абзаца — те же, что и в punctuated. У
+    третьей фразы говорящего нет (диаризация не покрыла кусок): на ней
+    проверяется строка без ярлыка.
+    """
+    sentences = _fixture_punctuated(fallback=fallback)["sentences"]
+    plan = [
+        ((0, 1), "Говорящий 1", 0),
+        ((2, 2), "Говорящий 2", 0),
+        ((3, 3), None, 1),
+        ((4, 4), "Говорящий 1", 2),
+        ((5, 5), "Говорящий 2", 2),
+    ]
+    phrases = []
+    for number, ((first, last), speaker, paragraph) in enumerate(plan):
+        covered = sentences[first : last + 1]
+        phrases.append(
+            {
+                "index": number,
+                "start": covered[0]["start"],
+                "end": covered[-1]["end"],
+                "text": " ".join(item["text"] for item in covered),
+                "speaker": speaker,
+                "sentences": [first, last],
+                "paragraph": paragraph,
+                "fallback": False,
+                "reason": "speaker" if speaker else "no-speaker",
+            }
+        )
+    names = ["Говорящий 1", "Говорящий 2"]
+    return {
+        "schema": SPEAKERS_SCHEMA,
+        "transcript": "data/output/созвон команды/transcript.json",
+        "punctuated": "data/output/созвон команды/punctuated.json",
+        "diarization": "data/output/созвон команды/diarization.json",
+        "pause": 1.0,
+        "speakers": [
+            {
+                "name": name,
+                "label": name,
+                "phrases": len([item for item in phrases if item["speaker"] == name]),
+                "speech_seconds": 100.0,
+                "share": 0.5,
+            }
+            for name in names
+        ],
+        "phrases": phrases,
+        "stats": {"speakers": len(names), "phrases": len(phrases)},
+    }
+
+
+def _fixture_roles() -> dict:
+    """Файл схемы roles/1: «Говорящий N → роль», как его пишет tools/roles.py."""
+    return {
+        "schema": ROLES_SCHEMA,
+        "speakers": "data/output/созвон команды/speakers.json",
+        "status": "ok",
+        "reason": "",
+        "roles": [
+            {"speaker": "Говорящий 1", "role": "Преподаватель", "share": 0.7, "source": "claude"},
+            {"speaker": "Говорящий 2", "role": "Студент 1", "share": 0.3, "source": "claude"},
+        ],
+        "stats": {"speakers": 2, "from_claude": 2, "defaulted": 0},
+    }
+
+
+# Документ, который инструмент собирает из _fixture_punctuated() и
+# _fixture_summary() без --speakers. Он выписан целиком, а не собран кодом,
+# именно затем, чтобы правка рендера не могла молча изменить в нём ни байта:
+# критерий требует, чтобы без --speakers вывод остался прежним.
+PLAIN_DOCUMENT = """# созвон команды
+
+## Саммари
+
+### Изложение
+
+Обсудили сборку итогового документа и порядок разделов в нём.
+
+Договорились, что технический блок в документ не идёт.
+
+### Темы
+
+- [00:00:00] Вступление и план созвона
+- [01:02:03] Формат итогового markdown
+
+### Решения, задачи, договорённости
+
+- [01:02:03] Таймкод на каждое предложение
+
+## Расшифровка
+
+[00:00:00] Добрый день, начинаем созвон.
+[00:00:04] Сегодня разбираем формат итогового файла.
+[00:00:09] Первый вопрос — заголовок документа.
+
+[00:00:59] Второй абзац того же окна.
+
+[01:02:03] Через час вернулись к таймкодам.
+[01:02:10] На этом закончили.
+"""
+
+
 def _write_json(path: str, payload: object) -> str:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -1009,6 +1662,7 @@ def _test_plain_document() -> None:
             text = handle.read()
         doc = parse_document(text)
 
+        _check(text == PLAIN_DOCUMENT, "документ собрался не байт в байт:\n%s" % text)
         _check(doc.title == "созвон команды", "заголовок по умолчанию: %r" % doc.title)
         _check(not doc.marks, "в чистом документе появились пометки: %r" % doc.marks)
         _check(len(doc.paragraphs) == 3, "абзацев %d, а в файле 3" % len(doc.paragraphs))
@@ -1406,12 +2060,337 @@ def _test_degraded_input() -> None:
         _check("Предложений:   5" in report, "в отчёте не то число предложений")
 
 
+def _speaker_lines(doc: ParsedDoc) -> list[tuple[int, str]]:
+    """Все строки расшифровки подряд — абзацы здесь проверяются отдельно."""
+    return [line for paragraph in doc.paragraphs for line in paragraph]
+
+
+def _test_speaker_labels() -> None:
+    """Расшифровка фразами: роль из roles/1, имя без него, строка без ярлыка."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
+        speakers = _write_json(os.path.join(workdir, "speakers.json"), _fixture_speakers())
+        roles = _write_json(os.path.join(workdir, "roles.json"), _fixture_roles())
+        summary = os.path.join(workdir, "summary.md")
+        write_text_file(summary, _fixture_summary())
+        out = os.path.join(workdir, "с ролями.md")
+
+        code, report, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary,
+             "--speakers", speakers, "--roles", roles, "--out", out]
+        )
+        _check(code == 0, "документ с ярлыками вернул код %d (stderr: %s)" % (code, stderr.strip()))
+        _check(not stderr.strip(), "при годных speakers и roles есть stderr: %s" % stderr.strip())
+
+        with open(out, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        doc = parse_document(text)
+        _check(not doc.notes, "при годной диаризации появилась пометка: %r" % doc.notes)
+        _check(not doc.marks, "в чистом документе появились пометки об откате")
+        _check(len(doc.paragraphs) == 3, "абзацев %d, а в speakers их 3" % len(doc.paragraphs))
+
+        # Фраза собрана из двух предложений, у третьей говорящего нет.
+        expected = [
+            (0, "Преподаватель", "Добрый день, начинаем созвон. Сегодня разбираем формат итогового файла."),
+            (9, "Студент 1", "Первый вопрос — заголовок документа."),
+            (59, None, "Второй абзац того же окна."),
+            (3723, "Преподаватель", "Через час вернулись к таймкодам."),
+            (3730, "Студент 1", "На этом закончили."),
+        ]
+        lines = _speaker_lines(doc)
+        _check(len(lines) == len(expected), "строк %d, а фраз %d" % (len(lines), len(expected)))
+        for (seconds, body), (want_seconds, want_label, want_text) in zip(lines, expected):
+            _check(seconds == want_seconds, "таймкод %d вместо %d у %r" % (seconds, want_seconds, body))
+            match = LABEL_RE.match(body)
+            if want_label is None:
+                _check(match is None, "у фразы без говорящего появился ярлык: %r" % body)
+                _check(body == want_text, "текст фразы без говорящего изменился: %r" % body)
+                continue
+            _check(match is not None, "в строке нет ярлыка говорящего: %r" % body)
+            _check(match.group("label") == want_label, "ярлык %r вместо %r" % (match.group("label"), want_label))
+            _check(match.group("text") == want_text, "текст фразы изменился: %r" % body)
+        _check(
+            "[00:00:00] Преподаватель: Добрый день" in text,
+            "строка с ярлыком не того вида",
+        )
+        _check("Фраз:          5" in report, "в отчёте нет числа фраз: %s" % report)
+
+        # Без --roles ярлык — имя говорящего от диаризации.
+        out2 = os.path.join(workdir, "без ролей.md")
+        code, _, _ = _run(
+            ["--punctuated", punctuated, "--summary", summary,
+             "--speakers", speakers, "--out", out2]
+        )
+        _check(code == 0, "документ без --roles вернул код %d" % code)
+        with open(out2, "r", encoding="utf-8") as handle:
+            doc2 = parse_document(handle.read())
+        labels = [LABEL_RE.match(body) for _, body in _speaker_lines(doc2)]
+        got = [match.group("label") if match else None for match in labels]
+        _check(
+            got == ["Говорящий 1", "Говорящий 2", None, "Говорящий 1", "Говорящий 2"],
+            "без --roles ярлыки не стали именами говорящих: %r" % got,
+        )
+
+        # Окно в откате: пометка та же и про тот же диапазон сегментов.
+        fall_punctuated = _write_json(
+            os.path.join(workdir, "fall.json"), _fixture_punctuated(fallback=True)
+        )
+        fall_speakers = _write_json(
+            os.path.join(workdir, "fall-speakers.json"), _fixture_speakers(fallback=True)
+        )
+        out3 = os.path.join(workdir, "откат.md")
+        code, _, _ = _run(
+            ["--punctuated", fall_punctuated, "--summary", summary,
+             "--speakers", fall_speakers, "--roles", roles, "--out", out3]
+        )
+        _check(code == 1, "документ фразами с откатом вернул код %d" % code)
+        with open(out3, "r", encoding="utf-8") as handle:
+            fall_text = handle.read()
+        doc3 = parse_document(fall_text)
+        _check(len(doc3.marks) == 1, "пометок об откате %d вместо одной" % len(doc3.marks))
+        _check(
+            "окно 1, сегменты 100–142" in doc3.marks[0],
+            "в пометке не тот диапазон сегментов: %r" % doc3.marks[0],
+        )
+        at = fall_text.rstrip("\n").split("\n").index(doc3.marks[0])
+        after = fall_text.rstrip("\n").split("\n")[at + 2]
+        _check(
+            after.startswith("[01:02:03] Преподаватель: "),
+            "после пометки не блок её окна: %r" % after,
+        )
+
+
+def _test_speakers_degraded() -> None:
+    """Негодные speakers/1 и roles/1: расшифровка предложениями, пометка, код 1."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
+        roles = _write_json(os.path.join(workdir, "roles.json"), _fixture_roles())
+        summary = os.path.join(workdir, "summary.md")
+        write_text_file(summary, _fixture_summary())
+
+        no_coverage = _fixture_speakers()
+        no_coverage["phrases"] = no_coverage["phrases"][:-1]  # предложение 5 осталось ничьим
+        overlap = _fixture_speakers()
+        overlap["phrases"][1]["sentences"] = [0, 2]
+        empty_text = _fixture_speakers()
+        empty_text["phrases"][2]["text"] = "   "
+        bad_speaker = _fixture_speakers()
+        bad_speaker["phrases"][0]["speaker"] = 17
+        no_bounds = _fixture_speakers()
+        no_bounds["phrases"][0].pop("sentences")
+
+        broken = os.path.join(workdir, "битый.json")
+        write_text_file(broken, '{"schema": "speakers/1", "phrases": [')
+
+        cases: list[tuple[str, list[str]]] = []
+        for name, payload in (
+            ("чужая схема", dict(_fixture_speakers(), schema="speakers/2")),
+            ("схема punctuated", dict(_fixture_speakers(), schema=SCHEMA)),
+            ("нет phrases", {"schema": SPEAKERS_SCHEMA, "speakers": []}),
+            ("phrases не список", {"schema": SPEAKERS_SCHEMA, "phrases": {}}),
+            ("phrases пуст", {"schema": SPEAKERS_SCHEMA, "phrases": []}),
+            ("фразы не покрывают предложения", no_coverage),
+            ("фразы перекрываются", overlap),
+            ("пустой текст фразы", empty_text),
+            ("speaker не строка", bad_speaker),
+            ("нет границ по предложениям", no_bounds),
+        ):
+            path = _write_json(os.path.join(workdir, "s-%d.json" % len(cases)), payload)
+            cases.append((name, ["--speakers", path]))
+        cases.append(("битый JSON", ["--speakers", broken]))
+        cases.append(("нет файла", ["--speakers", os.path.join(workdir, "нет.json")]))
+        cases.append(("каталог вместо файла", ["--speakers", workdir]))
+
+        good = _write_json(os.path.join(workdir, "speakers.json"), _fixture_speakers())
+        for name, payload in (
+            ("roles чужой схемы", dict(_fixture_roles(), schema="roles/2")),
+            ("roles без списка", {"schema": ROLES_SCHEMA, "status": "ok"}),
+            ("roles не список", {"schema": ROLES_SCHEMA, "roles": 5}),
+            ("роль не строка", {"schema": ROLES_SCHEMA, "roles": [{"speaker": "Говорящий 1", "role": 1}]}),
+            (
+                "говорящий дважды",
+                {
+                    "schema": ROLES_SCHEMA,
+                    "roles": [
+                        {"speaker": "Говорящий 1", "role": "Преподаватель"},
+                        {"speaker": "Говорящий 1", "role": "Студент 1"},
+                    ],
+                },
+            ),
+        ):
+            path = _write_json(os.path.join(workdir, "r-%d.json" % len(cases)), payload)
+            cases.append((name, ["--speakers", good, "--roles", path]))
+
+        fixture = _fixture_punctuated()["sentences"]
+        for number, (name, extra) in enumerate(cases):
+            out = os.path.join(workdir, "out-%d.md" % number)
+            code, report, stderr = _run(
+                ["--punctuated", punctuated, "--summary", summary, "--out", out] + extra
+            )
+            _check(code == 1, "случай %r вернул код %d, ожидался 1" % (name, code))
+            _check(stderr.strip() != "", "случай %r ничего не сказал в stderr" % name)
+
+            with open(out, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            doc = parse_document(text)
+            _check(len(doc.notes) == 1, "случай %r: пометок о ярлыках %d" % (name, len(doc.notes)))
+            reason = NOTE_RE.match(doc.notes[0]).group("reason")
+            _check(reason.strip() != "", "случай %r: пометка без причины" % name)
+
+            lines = _speaker_lines(doc)
+            _check(
+                [body for _, body in lines] == [item["text"] for item in fixture],
+                "случай %r: расшифровка собралась не предложениями" % name,
+            )
+            _check(
+                text.replace(doc.notes[0] + "\n\n", "", 1) == PLAIN_DOCUMENT,
+                "случай %r: документ отличается от обычного не только пометкой" % name,
+            )
+            _check(
+                "ярлыки говорящих не проставлены" in report,
+                "случай %r: в отчёте нет причины пометки" % name,
+            )
+
+        # Роли есть, но ни одна не про этих говорящих: это не беда файла —
+        # ярлыками становятся имена, пометки в документе нет, код 0.
+        strangers = _write_json(
+            os.path.join(workdir, "чужие роли.json"),
+            dict(
+                _fixture_roles(),
+                roles=[{"speaker": "Спикер A", "role": "Преподаватель", "share": 1.0, "source": "claude"}],
+            ),
+        )
+        out = os.path.join(workdir, "чужие роли.md")
+        code, _, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary,
+             "--speakers", good, "--roles", strangers, "--out", out]
+        )
+        _check(code == 0, "чужие роли вернули код %d, ожидался 0" % code)
+        _check("не совпала" in stderr, "про несовпадение ролей и имён не предупредили: %s" % stderr)
+        with open(out, "r", encoding="utf-8") as handle:
+            doc = parse_document(handle.read())
+        _check(not doc.notes, "при чужих ролях появилась пометка")
+        first = LABEL_RE.match(_speaker_lines(doc)[0][1])
+        _check(
+            first is not None and first.group("label") == "Говорящий 1",
+            "ярлыком не стало имя говорящего: %r" % _speaker_lines(doc)[0][1],
+        )
+
+
+def _test_speakers_note() -> None:
+    """--speakers-note: пометка под заголовком, код 1, расшифровка предложениями."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
+        speakers = _write_json(os.path.join(workdir, "speakers.json"), _fixture_speakers())
+        roles = _write_json(os.path.join(workdir, "roles.json"), _fixture_roles())
+        summary = os.path.join(workdir, "summary.md")
+        write_text_file(summary, _fixture_summary())
+        out = os.path.join(workdir, "пометка.md")
+
+        reason = "диаризация не запускалась (--no-diarize)"
+        code, report, _ = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out,
+             "--speakers-note", reason]
+        )
+        _check(code == 1, "--speakers-note вернул код %d, ожидался 1" % code)
+        with open(out, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        doc = parse_document(text)
+        _check(len(doc.notes) == 1, "пометок о ярлыках %d вместо одной" % len(doc.notes))
+        _check(
+            doc.notes[0] == "> ⚠️ Ярлыки говорящих не проставлены: %s." % reason,
+            "пометка не того вида: %r" % doc.notes[0],
+        )
+        # Пометка стоит сразу под заголовком раздела и отделена пустой строкой.
+        lines = text.rstrip("\n").split("\n")
+        at = lines.index(doc.notes[0])
+        _check(lines[at - 2] == TITLE_BODY, "над пометкой не заголовок расшифровки")
+        _check(lines[at + 1] == "", "после пометки нет пустой строки")
+        _check(
+            text.replace(doc.notes[0] + "\n\n", "", 1) == PLAIN_DOCUMENT,
+            "документ с пометкой отличается от обычного не только ею",
+        )
+        _check("Пометок:       1" in report, "в отчёте не та цифра пометок")
+        _check(reason in report, "в отчёте нет причины: %s" % report)
+
+        # Причина уже с точкой на конце не даёт двух точек подряд.
+        out2 = os.path.join(workdir, "с точкой.md")
+        code, _, _ = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out2,
+             "--speakers-note", "claude недоступен."]
+        )
+        _check(code == 1, "вторая пометка вернула код %d" % code)
+        with open(out2, "r", encoding="utf-8") as handle:
+            doc2 = parse_document(handle.read())
+        _check(
+            doc2.notes[0].endswith("claude недоступен."),
+            "в пометке две точки подряд: %r" % doc2.notes[0],
+        )
+
+        # Пометка сильнее файла: ярлыков не будет, даже если speakers годный.
+        out3 = os.path.join(workdir, "вместе.md")
+        code, _, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out3,
+             "--speakers", speakers, "--roles", roles, "--speakers-note", reason]
+        )
+        _check(code == 1, "пометка вместе с --speakers вернула код %d" % code)
+        _check("--speakers-note" in stderr, "про спор флагов не предупредили: %s" % stderr)
+        with open(out3, "r", encoding="utf-8") as handle:
+            text3 = handle.read()
+        _check("Преподаватель:" not in text3, "при пометке в документ попали ярлыки")
+        _check(
+            text3.replace("> ⚠️ Ярлыки говорящих не проставлены: %s.\n\n" % reason, "", 1)
+            == PLAIN_DOCUMENT,
+            "документ при споре флагов собран не предложениями",
+        )
+
+        # Пустая причина — ошибка вызова, а не пометка без текста.
+        code, _, stderr = _run(
+            ["--punctuated", punctuated, "--out", os.path.join(workdir, "нет.md"),
+             "--speakers-note", "   "]
+        )
+        _check(code == 2, "пустой --speakers-note вернул код %d, ожидался 2" % code)
+        _check(not os.path.exists(os.path.join(workdir, "нет.md")), "пустая причина оставила файл")
+
+
+def _test_without_speakers() -> None:
+    """Без --speakers документ прежний — ни одного изменённого байта."""
+    with tempfile.TemporaryDirectory(prefix="render-doc-selftest-") as workdir:
+        punctuated = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
+        roles = _write_json(os.path.join(workdir, "roles.json"), _fixture_roles())
+        summary = os.path.join(workdir, "summary.md")
+        write_text_file(summary, _fixture_summary())
+
+        out = os.path.join(workdir, "обычный.md")
+        code, report, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out]
+        )
+        _check(code == 0, "обычный прогон вернул код %d (stderr: %s)" % (code, stderr.strip()))
+        with open(out, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        _check(text == PLAIN_DOCUMENT, "документ без --speakers изменился:\n%s" % text)
+        _check("Предложений:   6" in report, "в отчёте не предложения, а что-то другое")
+
+        # --roles без --speakers ничего не меняет: только предупреждение.
+        out2 = os.path.join(workdir, "только роли.md")
+        code, _, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary, "--out", out2, "--roles", roles]
+        )
+        _check(code == 0, "--roles без --speakers вернул код %d" % code)
+        _check("--roles без --speakers" in stderr, "про бесполезный --roles не предупредили")
+        with open(out2, "r", encoding="utf-8") as handle:
+            _check(handle.read() == PLAIN_DOCUMENT, "--roles без --speakers изменил документ")
+
+
 def _test_help() -> None:
     """Справка — на русском, со всеми флагами, код 0."""
     for flag in ("-h", "--help"):
         code, out, _ = _run([flag])
         _check(code == 0, "%s вернул код %d" % (flag, code))
-        for needle in ("--punctuated", "--summary", "--out", "--title", "--selftest", "Использование"):
+        for needle in (
+            "--punctuated", "--summary", "--out", "--title", "--selftest",
+            "--speakers", "--roles", "--speakers-note", "Использование",
+        ):
             _check(needle in out, "в справке (%s) нет %r" % (flag, needle))
         _check(
             re.search(r"[а-яА-Я]", out) is not None,
@@ -1428,6 +2407,10 @@ def selftest() -> int:
         ("отсутствующее саммари", _test_missing_summary),
         ("непригодный вход и коды возврата", _test_broken_input),
         ("неполный вход: абзацы, окна, source", _test_degraded_input),
+        ("ярлыки говорящих в строках расшифровки", _test_speaker_labels),
+        ("негодные speakers и roles", _test_speakers_degraded),
+        ("пометка --speakers-note", _test_speakers_note),
+        ("без --speakers документ прежний", _test_without_speakers),
         ("справка", _test_help),
     )
     failed = 0
@@ -1477,9 +2460,12 @@ def main(argv: list[str]) -> int:
             warn(note)
         title = opts["title"].strip() if opts["title"] else default_title(data.source, opts["out"])
 
+        body, note, by_phrases = build_body(data, opts)
+
         # Документ собирается целиком до записи: лучше упасть с внятным
         # сообщением, чем оставить на диске половину результата.
-        content, stats = render_document(data, title, summary, opts["summary"])
+        content, stats = render_document(data, title, summary, opts["summary"], body, note)
+        stats.by_phrases = by_phrases
         write_text_file(opts["out"], content)
     except (UsageError, DocumentError) as exc:
         return die(str(exc))
