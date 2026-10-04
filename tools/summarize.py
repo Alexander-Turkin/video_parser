@@ -64,11 +64,28 @@ ClaudeFailed, а инструмент честно пишет «не получ�
 разделами фрагмента, а «#» и «##» разорвали бы документ), в stderr уходит
 предупреждение, а код возврата остаётся нулевым — саммари всё-таки получено.
 
+Кто что сказал. С --speakers (файл схемы speakers/1 от tools/speakers.py, при
+желании вместе с --roles от tools/roles.py) расшифровка подаётся claude не
+предложениями, а фразами говорящих — строками «[ЧЧ:ММ:СС] Ярлык: текст», — и
+промпт требует ярлык в двух разделах из восьми: в «Домашних заданиях» и в
+«Решениях, задачах, договорённостях». Ровно в двух, потому что имя отвечающего
+нужно там, где по саммари потом спрашивают: кому задано и кто за что взялся.
+Остальные шесть разделов остаются прежними: кто произнёс термин или назвал
+книгу, читателю не важно, а ярлык в каждой строке превратил бы саммари в
+протокол. Без --speakers промпт и фрагмент не меняются ни на байт.
+
+Негодный speakers/1 или roles/1 саммари не отменяет: о беде говорится в stderr,
+и работа идёт по старому пути — по предложениям punctuated/1 и без ярлыков.
+Саммари дороже ярлыков, а повторить вызов claude нечем.
+
 Зависимости: только стандартная библиотека. Сам claude запускается через
 tools/claude_cli.py — это единственное место в проекте, где собирается его
 командная строка; своего subprocess здесь нет. Формат таймкода берётся оттуда
 же, откуда его читает сборщик документа, — из tools/render_doc.py, чтобы
-«[01:02:03]» в саммари и в расшифровке означало одно и то же.
+«[01:02:03]» в саммари и в расшифровке означало одно и то же; оттуда же взяты
+разбор speakers/1 и roles/1 и правило, каким ярлыком подписывать фразу
+(load_speakers, load_roles, speaker_label), — иначе две половины одного
+документа понимали бы эти файлы по-разному.
 
 Проверки живут в самом файле (--selftest): в окружении проекта нет pytest.
 Установленный claude для них не нужен и намеренно не используется — все вызовы
@@ -76,6 +93,8 @@ tools/claude_cli.py — это единственное место в проек
 
 Использование:
   python tools/summarize.py --punctuated <файл.json> --out <файл.md>
+  python tools/summarize.py --punctuated <файл.json> --speakers <файл.json> \\
+      --roles <файл.json> --out <файл.md>
   python tools/summarize.py --transcript <файл.json> --out <файл.md>
   python tools/summarize.py --selftest
 """
@@ -90,7 +109,7 @@ import re
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # Каталог tools/ в sys.path: при запуске файла скриптом он там уже первый, но
 # при импорте модуля откуда-то ещё — нет.
@@ -99,7 +118,17 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 import claude_cli  # noqa: E402 — импорт возможен только после правки sys.path выше
-from render_doc import format_timecode  # noqa: E402 — тот же формат, что в документе
+
+# Формат таймкода, разбор speakers/1 и roles/1 и правило выбора ярлыка берутся у
+# сборщика документа: саммари и расшифровка в одном файле обязаны понимать эти
+# файлы одинаково, а значит, читать их одним и тем же кодом.
+from render_doc import (  # noqa: E402 — импорт возможен только после правки sys.path выше
+    SpeakersError,
+    format_timecode,
+    load_roles,
+    load_speakers,
+    speaker_label,
+)
 
 PROG = "summarize.py"
 
@@ -121,6 +150,12 @@ OVERVIEW = "overview"
 HOMEWORK = "homework"
 DEADLINES = "deadlines"
 TOPICS = "topics"
+ACTIONS = "actions"
+
+# Разделы, в строках которых стоит ярлык говорящего, когда он вообще известен:
+# «кому задано» и «кто за что взялся» — это и есть ответ владельца на вопрос,
+# где в саммари нужны говорящие.
+LABELLED_KEYS: tuple[str, ...] = (HOMEWORK, ACTIONS)
 
 
 @dataclass(frozen=True)
@@ -149,7 +184,7 @@ SECTIONS: tuple[Section, ...] = (
     Section(TOPICS, SECTION_TOPICS, "Темы", "Тем"),
     Section(HOMEWORK, SECTION_HOMEWORK, "Домашние задания", "Домашних заданий"),
     Section(DEADLINES, SECTION_DEADLINES, "Сроки и дедлайны", "Сроков"),
-    Section("actions", SECTION_ACTIONS, "Решения, задачи, договорённости", "Решений"),
+    Section(ACTIONS, SECTION_ACTIONS, "Решения, задачи, договорённости", "Решений"),
     Section("terms", SECTION_TERMS, "Термины и определения", "Терминов"),
     Section("materials", SECTION_MATERIALS, "Материалы и ссылки", "Материалов"),
 )
@@ -183,6 +218,8 @@ LOG_TAG = "саммари"
 
 HELP = """Использование:
   python tools/summarize.py --punctuated <файл.json> --out <файл.md> [опции]
+  python tools/summarize.py --punctuated <файл.json> --speakers <файл.json> \\
+      --roles <файл.json> --out <файл.md> [опции]
   python tools/summarize.py --transcript <файл.json> --out <файл.md> [опции]
   python tools/summarize.py --selftest
 
@@ -218,12 +255,30 @@ markdown-фрагмент с восемью разделами уровня «##
 брать таймкоды только из этих строк. Сам claude запускается через
 tools/claude_cli.py как `claude -p <промпт>`; модель не задаётся.
 
+С --speakers расшифровка подаётся в промпт не предложениями, а фразами
+говорящих — строками «[ЧЧ:ММ:СС] Ярлык: текст», — и промпт требует ярлык в двух
+разделах из восьми: «Домашние задания» и «Решения, задачи, договорённости».
+Строка там выглядит как «- [ЧЧ:ММ:СС] Преподаватель: задание — срок: …».
+Остальные шесть разделов не меняются: ярлыков в них нет, и в «Сроках и
+дедлайнах» по-прежнему повторяется срок из строки домашнего задания. Ярлык —
+это роль из --roles, а без него имя говорящего («Говорящий 1»); у фразы, за
+которой говорящего нет, ярлыка нет тоже. Если claude ярлык в строке не
+поставил, строка всё равно попадает во фрагмент, а число таких строк — в
+stderr. Негодный speakers/1 или roles/1 саммари не отменяет: о беде говорится в
+stderr, и оно делается по предложениям --punctuated, без ярлыков.
+
 Опции:
   --punctuated <файл>  JSON схемы punctuated/1 от tools/punctuate.py
   --transcript <файл>  JSON схемы transcript/1 от tools/transcribe.py —
                        подстраховка на случай, если пунктуации ещё нет: текст
                        там дословный, саммари по нему хуже. При обоих флагах
                        берётся --punctuated
+  --speakers <файл>    JSON схемы speakers/1 от tools/speakers.py: фразы с
+                       говорящими. С ним в двух разделах саммари появляется
+                       ярлык того, кто это сказал
+  --roles <файл>       JSON схемы roles/1 от tools/roles.py: соответствие
+                       «Говорящий N → Преподаватель». Без него ярлык — имя
+                       говорящего; без --speakers файл не используется
   --out <файл>         куда записать markdown-фрагмент (обязателен)
   --timeout <сек>      сколько ждать один вызов claude (по умолчанию {timeout:g})
   --attempts <N>       сколько попыток вызова делать (по умолчанию {attempts};
@@ -246,6 +301,10 @@ tools/claude_cli.py как `claude -p <промпт>`; модель не зад�
 Примеры:
   python tools/summarize.py --punctuated data/output/лекция/punctuated.json \\
       --out data/output/лекция/summary.md --log-dir data/output/лекция/claude
+  python tools/summarize.py --punctuated data/output/лекция/punctuated.json \\
+      --speakers data/output/лекция/speakers.json \\
+      --roles data/output/лекция/roles.json \\
+      --out data/output/лекция/summary.md
   python tools/summarize.py --transcript data/output/лекция/transcript.json \\
       --out data/output/лекция/summary.md --timeout 600
 """.format(
@@ -285,10 +344,15 @@ def warn(message: str) -> None:
 
 @dataclass
 class Line:
-    """Одна строка расшифровки для промпта: таймкод начала и текст."""
+    """Одна строка расшифровки для промпта: таймкод начала и текст.
+
+    label — ярлык говорящего («Преподаватель», «Студент 1») или None: он есть
+    только в режиме --speakers и только у фразы, говорящий которой известен.
+    """
 
     start: float
     text: str
+    label: str | None = None
 
 
 @dataclass
@@ -297,6 +361,12 @@ class Record:
 
     duration — длина записи в секундах, если она в файле есть; по ней видно,
     что таймкод в ответе claude выдуман (ушёл за конец записи).
+
+    labels — ярлыки говорящих этой записи в порядке первого появления. Пустой
+    список означает «ярлыков нет»: так и без --speakers, и с ним, если
+    диаризация не дала говорящего ни одной фразе. По этому же списку потом
+    проверяется, поставил ли claude ярлык в строке, — чужой ярлык в саммари
+    такой же выдуманный факт, как чужой таймкод.
     """
 
     path: str
@@ -304,6 +374,7 @@ class Record:
     source: str
     duration: float | None
     lines: list[Line]
+    labels: list[str] = field(default_factory=list)
 
     @property
     def last_second(self) -> float:
@@ -470,6 +541,53 @@ def _check_schema(data: dict, expected: str) -> None:
         raise InputError("не та схема: ожидается %r, в файле %r" % (expected, data["schema"]))
 
 
+def apply_speakers(record: Record, opts: dict) -> Record:
+    """Подменяет строки промпта фразами говорящих с ярлыками.
+
+    Беда speakers/1 или roles/1 саммари не отменяет: о ней говорится в stderr, и
+    возвращается тот же record, что пришёл, — промпт собирается по предложениям
+    punctuated/1 и без ярлыков. Саммари дороже ярлыков: распознавание записи
+    стоит двух часов, а второго вызова claude здесь нет.
+
+    Разбор обоих файлов и выбор ярлыка взяты у tools/render_doc.py: в итоговом
+    документе саммари и расшифровка стоят рядом, и «Преподаватель» в них обязан
+    означать одного и того же человека.
+    """
+    if opts["roles"] and not opts["speakers"]:
+        warn("--roles без --speakers не используется: ярлыки берутся из фраз speakers/1")
+    if not opts["speakers"]:
+        return record
+
+    try:
+        speakers = load_speakers(opts["speakers"])
+        roles = load_roles(opts["roles"]) if opts["roles"] else None
+        if roles and speakers.names and not any(name in roles for name in speakers.names):
+            # Не беда файла, а рассогласование двух файлов: ярлыками станут
+            # имена говорящих, и это лучше, чем саммари без ярлыков вовсе.
+            warn(
+                "ни одна роль из %s не совпала с именами говорящих — "
+                "ярлыками будут имена" % opts["roles"]
+            )
+    except SpeakersError as exc:
+        warn("%s — саммари делается по предложениям, без ярлыков" % exc)
+        return record
+
+    lines: list[Line] = []
+    labels: list[str] = []
+    for phrase in speakers.phrases:
+        label = speaker_label(phrase, roles)
+        if label and label not in labels:
+            labels.append(label)
+        lines.append(Line(start=phrase.start, text=phrase.text, label=label))
+    if not labels:
+        warn(
+            "в %s ни у одной фразы нет говорящего — ярлыков в саммари не будет"
+            % opts["speakers"]
+        )
+    lines.sort(key=lambda line: line.start)
+    return replace(record, lines=lines, labels=labels)
+
+
 def load_record(path: str, schema: str) -> Record:
     """Читает входной файл. Любая беда на входе — InputError, не трейсбек."""
     try:
@@ -500,13 +618,28 @@ def load_record(path: str, schema: str) -> Record:
 
 # ----------------------------------------------------------------- промпт ---
 
-PROMPT_HEAD = """Сделай саммари рабочей записи (лекция или рабочий созвон).
+PROMPT_INTRO = """Сделай саммари рабочей записи (лекция или рабочий созвон).
 
 Ниже — расшифровка записи: каждая строка это одно высказывание с таймкодом в
 начале, вида «[ЧЧ:ММ:СС] текст». Речь русская, в тексте встречаются имена
 коллег и названия продуктов.
 
-Требования к ответу:
+"""
+
+# То же вступление, когда в расшифровке есть ярлыки говорящих. Отдельным
+# текстом, а не вставкой в прежний: строка расшифровки описывается здесь один
+# раз, и описание обязано совпадать с тем, что claude увидит ниже.
+PROMPT_INTRO_LABELLED = """Сделай саммари рабочей записи (лекция или рабочий созвон).
+
+Ниже — расшифровка записи: каждая строка это одно высказывание с таймкодом и
+ярлыком говорящего в начале, вида «[ЧЧ:ММ:СС] Ярлык: текст». Ярлык — это кто
+говорит: «Преподаватель», «Студент 1». У высказывания, говорящий которого
+неизвестен, ярлыка нет, и строка выглядит как «[ЧЧ:ММ:СС] текст». Речь русская,
+в тексте встречаются имена коллег и названия продуктов.
+
+"""
+
+PROMPT_RULES = """Требования к ответу:
 
 1. Отвечай по-русски. Кроме самого саммари в ответе не должно быть ничего: ни
    вступления, ни пояснений, ни замечаний о том, как ты его делал.
@@ -585,21 +718,48 @@ PROMPT_HEAD = """Сделай саммари рабочей записи (лек
    Заголовок раздела при этом всё равно нужен: разделов в ответе всегда восемь.
 7. Заголовков уровня «#» и «##» в ответе быть не должно: только «###» у восьми
    разделов выше.
+"""
 
+# Восьмое требование — только когда в расшифровке есть ярлыки. Два раздела
+# названы поимённо: в саммари спрашивают «кому задано» и «кто за что взялся», и
+# ответ на это — ярлык в начале строки. В остальных шести он был бы шумом.
+PROMPT_LABEL_RULE = """8. В разделах «Домашние задания» и «Решения, задачи, договорённости» каждая
+   строка начинается с ярлыка того, кто это сказал, сразу после таймкода:
+   - [ЧЧ:ММ:СС] Ярлык: текст
+   Ярлык бери из той строки расшифровки, к которой относится пункт, и пиши его
+   слово в слово; своих ярлыков не выдумывай. Если у строки расшифровки ярлыка
+   нет, пиши пункт без него. В остальных шести разделах ярлыка не ставь: строка
+   там прежняя — «- [ЧЧ:ММ:СС] текст».
+"""
+
+PROMPT_TAIL = """
 Расшифровка записи:
 
 """
 
+# Промпт без ярлыков — тот же текст, что и до появления --speakers: разделы,
+# требования и порядок в нём не трогались.
+PROMPT_HEAD = PROMPT_INTRO + PROMPT_RULES + PROMPT_TAIL
+
 
 def render_line(line: Line) -> str:
-    """Строка расшифровки для промпта: «[ЧЧ:ММ:СС] текст»."""
+    """Строка расшифровки для промпта: «[ЧЧ:ММ:СС] текст» или с ярлыком."""
+    if line.label:
+        return "[%s] %s: %s" % (format_timecode(line.start), line.label, line.text)
     return "[%s] %s" % (format_timecode(line.start), line.text)
+
+
+def build_prompt_head(labelled: bool) -> str:
+    """Требования промпта: с восьмым пунктом про ярлыки или без него."""
+    if not labelled:
+        return PROMPT_HEAD
+    return PROMPT_INTRO_LABELLED + PROMPT_RULES + PROMPT_LABEL_RULE + PROMPT_TAIL
 
 
 def build_prompt(record: Record) -> str:
     """Собирает промпт одного вызова: требования и вся расшифровка целиком."""
     body = "\n".join(render_line(line) for line in record.lines)
-    return PROMPT_HEAD + body + "\n"
+    return build_prompt_head(bool(record.labels)) + body + "\n"
 
 
 # ------------------------------------------------------- разбор ответа ---
@@ -635,6 +795,11 @@ TRAILING_RE = re.compile(r"[\s.,;:—–-]+$")
 
 # Готовая строка домашнего задания — ею же проверяется, что срок назван.
 HOMEWORK_LINE_RE = re.compile(r"^- \[[^\]]+\] (?P<task>.+?) — срок: (?P<deadline>.+)$")
+
+# Ярлык в начале пункта: «Преподаватель: прочитать главу». Что стоит до первого
+# двоеточия, сверяется потом со списком ярлыков записи — иначе за ярлык сошло бы
+# любое «Решение:» или «Вывод:», написанное claude от себя.
+LABEL_RE = re.compile(r"^(?P<label>[^:]{1,60}):\s+(?P<rest>\S.*)$")
 
 
 def _section_key(text: str) -> str:
@@ -831,15 +996,32 @@ def homework_body(body: str) -> str | None:
     return "%s — срок: %s" % (task, deadline)
 
 
+def has_label(body: str, labels: set[str]) -> bool:
+    """Начинается ли пункт с ярлыка кого-то из говорящих этой записи."""
+    match = LABEL_RE.match(body)
+    if match is None:
+        return False
+    return _section_key(match.group("label")) in labels
+
+
 def _list_items(lines: list[str], record: Record, section: Section) -> list[str]:
     """Строки списочного раздела -> строки «- [ЧЧ:ММ:СС] текст».
 
     Строки без таймкода выбрасываются: это либо «Основные темы:» перед списком,
     либо пункт, у которого таймкода нет вовсе, а выдумать его инструмент не
     вправе. Сколько выброшено и из какого раздела — говорится в stderr.
+
+    В двух разделах из восьми строка должна начинаться ещё и с ярлыка
+    говорящего — но только когда ярлыки вообще есть. Строка без ярлыка всё
+    равно попадает во фрагмент: подписать её самому значит угадать, кто это
+    сказал, а потерять — выбросить из саммари задание или договорённость.
+    Поэтому несделанное claude считается и называется в stderr.
     """
     items: list[str] = []
     dropped = 0
+    unlabelled = 0
+    labels = {_section_key(label) for label in record.labels}
+    wants_label = bool(labels) and section.key in LABELLED_KEYS
     limit = record.last_second
     for line in lines:
         text = line.strip()
@@ -853,11 +1035,16 @@ def _list_items(lines: list[str], record: Record, section: Section) -> list[str]
             dropped += 1
             continue
         seconds, body = found
+        # Ярлык ищется в пункте до того, как строка ДЗ пересобирается по сроку:
+        # там он стоит первым, а после пересборки — внутри текста задания.
+        said_who = has_label(body, labels)
         if section.key == HOMEWORK and body:
             body = homework_body(body) or ""
         if not body:
             dropped += 1
             continue
+        if wants_label and not said_who:
+            unlabelled += 1
         if limit and seconds > limit + 1:
             warn(
                 "%s: таймкод %s за пределами записи (%s) — строка оставлена как есть"
@@ -867,6 +1054,11 @@ def _list_items(lines: list[str], record: Record, section: Section) -> list[str]
     if dropped:
         warn(
             "%s: %d строк без таймкода не попали во фрагмент" % (section.name, dropped)
+        )
+    if unlabelled:
+        warn(
+            "%s: в %d строках claude не поставил ярлык говорящего — строки "
+            "оставлены как есть" % (section.name, unlabelled)
         )
     return items
 
@@ -1028,6 +1220,9 @@ def print_report(path: str, size: int, record: Record, summary: Summary) -> None
     sys.stdout.write(report_row("Размер", "%d байт" % size))
     sys.stdout.write(report_row("Вход", "%s (%s)" % (record.path, record.schema)))
     sys.stdout.write(report_row("Строк", "%d" % len(record.lines)))
+    if record.labels:
+        # Строка появляется только с --speakers: без него отчёт прежний.
+        sys.stdout.write(report_row("Ярлыков", ", ".join(record.labels)))
     if summary.received:
         # Пунктов по каждому из семи списочных разделов: по этим цифрам в логе
         # прогона видно, что именно саммари вытащило из записи.
@@ -1050,6 +1245,8 @@ def print_report(path: str, size: int, record: Record, summary: Summary) -> None
 _FLAGS_VALUE = {
     "--punctuated": "punctuated",
     "--transcript": "transcript",
+    "--speakers": "speakers",
+    "--roles": "roles",
     "--out": "out",
     "--timeout": "timeout",
     "--attempts": "attempts",
@@ -1066,6 +1263,8 @@ def parse_args(argv: list[str]) -> dict:
     opts: dict = {
         "punctuated": None,
         "transcript": None,
+        "speakers": None,
+        "roles": None,
         "out": None,
         "timeout": claude_cli.DEFAULT_TIMEOUT,
         "attempts": claude_cli.DEFAULT_ATTEMPTS,
@@ -1203,6 +1402,7 @@ def main(argv: list[str]) -> int:
     if schema == TRANSCRIPT_SCHEMA:
         warn("вход — транскрипт без пунктуации: саммари по нему хуже, чем по punctuated/1")
 
+    record = apply_speakers(record, opts)
     summary = make_summary(record, opts)
     try:
         write_text_file(opts["out"], render_fragment(summary))
@@ -1294,12 +1494,18 @@ def _calls(stub: str) -> int:
 
 
 def _prompt_of(stub: str) -> str:
-    """Промпт, с которым позвали заглушку: второй аргумент после -p."""
+    """Промпт, с которым позвали заглушку: второй аргумент после -p.
+
+    Заглушка пишет аргументы через printf '%s\\n', поэтому последний перевод
+    строки в файле — её собственный, и его здесь снимают: иначе промпт нельзя
+    сверить с ожидаемым текстом целиком, а только по кускам.
+    """
     recorded = os.path.join(os.path.dirname(stub), "argv.txt")
     with open(recorded, "r", encoding="utf-8") as handle:
         text = handle.read()
     _check(text.startswith("-p\n"), "команда не начинается с -p: %r" % text[:20])
-    return text[len("-p\n"):]
+    _check(text.endswith("\n"), "в записи аргументов нет перевода строки от printf")
+    return text[len("-p\n"):-1]
 
 
 def _run(argv: list[str], binary: str | None = None) -> tuple[int, str, str]:
@@ -1392,6 +1598,139 @@ def _fixture_transcript() -> dict:
         ],
         "metrics": {"words": 0},
     }
+
+
+def _fixture_speakers() -> dict:
+    """Файл схемы speakers/1 под те же предложения: четыре фразы, два говорящих.
+
+    У третьей фразы говорящего нет (диаризация не покрыла кусок) — на ней
+    проверяется строка промпта без ярлыка. Начала фраз совпадают с таймкодами,
+    которыми пользуются ответы-фикстуры: 00:00:00, 00:10:00, 01:02:03, 02:35:29.
+    """
+    sentences = _fixture_punctuated()["sentences"]
+    plan = [((0, 1), "Говорящий 1", 0), ((2, 2), "Говорящий 2", 0),
+            ((3, 3), None, 1), ((4, 4), "Говорящий 1", 1)]
+    phrases = []
+    for number, ((first, last), speaker, paragraph) in enumerate(plan):
+        covered = sentences[first : last + 1]
+        phrases.append(
+            {
+                "index": number,
+                "start": covered[0]["start"],
+                "end": covered[-1]["end"],
+                "text": " ".join(item["text"] for item in covered),
+                "speaker": speaker,
+                "sentences": [first, last],
+                "paragraph": paragraph,
+                "fallback": False,
+                "reason": "speaker" if speaker else "no-speaker",
+            }
+        )
+    names = ["Говорящий 1", "Говорящий 2"]
+    return {
+        "schema": "speakers/1",
+        "transcript": "data/output/созвон команды/transcript.json",
+        "punctuated": "data/output/созвон команды/punctuated.json",
+        "diarization": "data/output/созвон команды/diarization.json",
+        "pause": 1.0,
+        "speakers": [
+            {
+                "name": name,
+                "label": name,
+                "phrases": len([item for item in phrases if item["speaker"] == name]),
+                "speech_seconds": 100.0,
+                "share": 0.5,
+            }
+            for name in names
+        ],
+        "phrases": phrases,
+        "stats": {"speakers": len(names), "phrases": len(phrases)},
+    }
+
+
+def _fixture_roles() -> dict:
+    """Файл схемы roles/1: «Говорящий N → роль», как его пишет tools/roles.py."""
+    return {
+        "schema": "roles/1",
+        "speakers": "data/output/созвон команды/speakers.json",
+        "status": "ok",
+        "reason": "",
+        "roles": [
+            {"speaker": "Говорящий 1", "role": "Преподаватель", "share": 0.7, "source": "claude"},
+            {"speaker": "Говорящий 2", "role": "Студент 1", "share": 0.3, "source": "claude"},
+        ],
+        "stats": {"speakers": 2, "from_claude": 2, "defaulted": 0},
+    }
+
+
+# Строки расшифровки в промпте без --speakers: по предложениям и без ярлыков.
+# Выписаны литералами, а не собраны из фикстуры: критерий требует, чтобы без
+# --speakers промпт остался прежним, и сверять его с кодом, который его же и
+# собирает, бессмысленно.
+PLAIN_PROMPT_BODY = (
+    "[00:00:00] Добрый день, начинаем разбор формата итогового документа.\n"
+    "[00:00:06] Сначала обсудим расшифровку, потом саммари.\n"
+    "[00:10:00] Таймкод у каждого предложения, это решение уже принято.\n"
+    "[01:02:03] Через час вернулись к нарезке текста на окна.\n"
+    "[02:35:29] На этом закончили, задачи разошлись по исполнителям.\n"
+)
+
+# Те же строки, но по фразам говорящих и с ярлыками (--speakers и --roles).
+LABELLED_PROMPT_BODY = (
+    "[00:00:00] Преподаватель: Добрый день, начинаем разбор формата итогового "
+    "документа. Сначала обсудим расшифровку, потом саммари.\n"
+    "[00:10:00] Студент 1: Таймкод у каждого предложения, это решение уже принято.\n"
+    "[01:02:03] Через час вернулись к нарезке текста на окна.\n"
+    "[02:35:29] Преподаватель: На этом закончили, задачи разошлись по исполнителям.\n"
+)
+
+# Фрагмент, который инструмент собирает из _good_answer() без --speakers. Он
+# выписан целиком по той же причине, что и строки промпта выше: критерий
+# «совпадает с текущим байт в байт» проверяется только сверкой с литералом.
+PLAIN_FRAGMENT = """### Изложение
+
+Созвон был посвящён формату итогового документа: сначала разобрали, как выглядит расшифровка, потом перешли к саммари.
+
+Отдельно обсудили таймкоды и подтвердили прежнее решение — ставить их на каждое предложение.
+
+В конце вернулись к нарезке текста на окна и разошлись по задачам.
+
+### Ключевые моменты
+
+- [00:00:00] Итоговый документ состоит из саммари и расшифровки
+- [00:10:00] Таймкод нужен у каждого предложения
+- [01:02:03] Текст уходит в обработку окнами
+
+### Темы
+
+- [00:00:00] Разбор формата итогового документа
+- [00:10:00] Таймкод у каждого предложения
+- [01:02:03] Нарезка текста на окна
+
+### Домашние задания
+
+- [01:02:03] Прочитать главу про нарезку текста — срок: к следующему занятию
+- [02:35:29] Прислать примеры своих записей — срок: не назван
+
+### Сроки и дедлайны
+
+- [01:02:03] Прочитать главу про нарезку текста — срок: к следующему занятию
+- [02:35:29] Сдать итоговый документ — срок: до 15 октября
+
+### Решения, задачи, договорённости
+
+- [00:10:00] Таймкод ставится на каждое предложение
+- [02:35:29] Задачи разошлись по исполнителям
+
+### Термины и определения
+
+- [00:10:00] Таймкод — время от начала записи в виде ЧЧ:ММ:СС
+- [01:02:03] Окно — кусок текста, уходящий в один вызов
+
+### Материалы и ссылки
+
+- [01:02:03] Глава про нарезку текста в документации проекта
+"""
 
 
 _OVERVIEW_DEFAULT = "Первый абзац.\n\nВторой абзац.\n\nТретий абзац."
@@ -2036,6 +2375,334 @@ def _test_transcript_mode() -> None:
         )
 
 
+def _labelled_answer() -> str:
+    """Ответ claude, какого требует промпт с ярлыками: они ровно в двух разделах."""
+    return _answer(
+        homework=(
+            "- [00:00:00] Преподаватель: Прочитать главу про нарезку текста — "
+            "срок: к следующему занятию\n"
+            "- [00:10:00] Студент 1: Прислать примеры своих записей"
+        ),
+        deadlines="- [00:00:00] Прочитать главу про нарезку текста — срок: к следующему занятию",
+        actions=(
+            "- [00:10:00] Студент 1: Таймкод ставится на каждое предложение\n"
+            "- [02:35:29] Преподаватель: Задачи разошлись по исполнителям"
+        ),
+        topics="- [00:00:00] Разбор формата итогового документа",
+    )
+
+
+def _test_speaker_labels() -> None:
+    """--speakers: фразы с ярлыками в промпте и ярлыки в двух разделах саммари."""
+    with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
+        source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
+        speakers = _write_json(os.path.join(workdir, "speakers.json"), _fixture_speakers())
+        roles = _write_json(os.path.join(workdir, "roles.json"), _fixture_roles())
+        stub = _answering_stub(workdir, "ок", _labelled_answer())
+        out = os.path.join(workdir, "саммари.md")
+
+        argv = ["--punctuated", source, "--speakers", speakers, "--roles", roles, "--out", out]
+        code, report, stderr = _run(argv, stub)
+        _check(code == 0, "прогон с ярлыками вернул код %d (stderr: %s)" % (code, stderr.strip()))
+        _check(_calls(stub) == 1, "claude позван %d раз, а должен ровно один" % _calls(stub))
+        _check(not stderr.strip(), "при годных speakers и roles есть stderr: %s" % stderr.strip())
+
+        # Тело промпта — фразы с ярлыками, а не предложения: у фразы без
+        # говорящего ярлыка нет, у остальных это роль из roles/1.
+        prompt = _prompt_of(stub)
+        _check(
+            prompt.endswith(LABELLED_PROMPT_BODY),
+            "тело промпта собрано не по фразам с ярлыками: %r" % prompt[-400:],
+        )
+        _check(PLAIN_PROMPT_BODY not in prompt, "в промпте остались строки по предложениям")
+        # Требование про ярлык названо, и названы оба раздела.
+        for needle in (
+            "«[ЧЧ:ММ:СС] Ярлык: текст»",
+            "- [ЧЧ:ММ:СС] Ярлык: текст",
+            "В разделах «Домашние задания» и «Решения, задачи, договорённости» каждая",
+            "начинается с ярлыка того, кто это сказал",
+            "своих ярлыков не выдумывай",
+            "В остальных шести разделах ярлыка не ставь",
+        ):
+            _check(needle in prompt, "в промпте нет требования %r" % needle)
+        # Прежние требования никуда не делись: прибавился ровно восьмой пункт.
+        for needle in (
+            "ТОЛЬКО из начала строк расшифровки",
+            "ровно из восьми разделов",
+            "- [ЧЧ:ММ:СС] задание — срок: как сказано в записи",
+            "повтори здесь отдельной строкой",
+            "- не прозвучало",
+        ):
+            _check(needle in prompt, "в промпте с ярлыками потерялось требование %r" % needle)
+
+        fragment = parse_fragment(_read(out))
+        _check(
+            fragment["homework"] == [
+                "- [00:00:00] Преподаватель: Прочитать главу про нарезку текста — "
+                "срок: к следующему занятию",
+                "- [00:10:00] Студент 1: Прислать примеры своих записей — срок: %s"
+                % DEADLINE_UNKNOWN,
+            ],
+            "домашние задания без ярлыков: %r" % fragment["homework"],
+        )
+        _check(
+            fragment["actions"] == [
+                "- [00:10:00] Студент 1: Таймкод ставится на каждое предложение",
+                "- [02:35:29] Преподаватель: Задачи разошлись по исполнителям",
+            ],
+            "решения без ярлыков: %r" % fragment["actions"],
+        )
+        # Остальные шесть разделов формат не меняют: ярлыков в них нет, а срок
+        # задания по-прежнему повторён строкой в «Сроках и дедлайнах».
+        for key in LIST_KEYS:
+            if key in LABELLED_KEYS:
+                continue
+            for line in fragment[key]:
+                _check(
+                    line == NOTHING or ITEM_RE.match(line) is not None,
+                    "раздел %s: строка не того вида: %r" % (key, line),
+                )
+                for label in ("Преподаватель:", "Студент 1:"):
+                    _check(label not in line, "раздел %s: ярлык в чужом разделе: %r" % (key, line))
+        _check(
+            fragment["deadlines"] == [
+                "- [00:00:00] Прочитать главу про нарезку текста — срок: к следующему занятию"
+            ],
+            "срок ДЗ не повторён строкой без ярлыка: %r" % fragment["deadlines"],
+        )
+        _check(report_row("Ярлыков", "Преподаватель, Студент 1") in report,
+               "в отчёте нет ярлыков говорящих:\n%s" % report)
+
+        # Без --roles ярлык — имя говорящего от диаризации.
+        plain = _answering_stub(
+            workdir, "имена", _answer(actions="- [00:10:00] Говорящий 2: Таймкод обсудили")
+        )
+        out2 = os.path.join(workdir, "имена.md")
+        code, _, stderr = _run(
+            ["--punctuated", source, "--speakers", speakers, "--out", out2], plain
+        )
+        _check(code == 0, "прогон без --roles вернул код %d" % code)
+        _check(
+            "[00:00:00] Говорящий 1: Добрый день" in _prompt_of(plain),
+            "без --roles ярлыком стало не имя говорящего",
+        )
+        _check(
+            parse_fragment(_read(out2))["actions"]
+            == ["- [00:10:00] Говорящий 2: Таймкод обсудили"],
+            "строка с именем говорящего не сохранилась",
+        )
+        _check(
+            "не поставил ярлык" not in stderr,
+            "имя говорящего не сошло за ярлык: %s" % stderr,
+        )
+
+        # --roles без --speakers ничего не меняет: только предупреждение.
+        out3 = os.path.join(workdir, "только-роли.md")
+        bare = _answering_stub(workdir, "без-фраз", _good_answer())
+        code, _, stderr = _run(["--punctuated", source, "--roles", roles, "--out", out3], bare)
+        _check(code == 0, "--roles без --speakers вернул код %d" % code)
+        _check("--roles без --speakers" in stderr, "про бесполезный --roles не предупредили")
+        _check(_read(out3) == PLAIN_FRAGMENT, "--roles без --speakers изменил фрагмент")
+
+
+def _test_labels_missing() -> None:
+    """Claude не поставил ярлык: строки остаются, в stderr — число таких строк."""
+    with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
+        source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
+        speakers = _write_json(os.path.join(workdir, "speakers.json"), _fixture_speakers())
+        roles = _write_json(os.path.join(workdir, "roles.json"), _fixture_roles())
+        # Тот же ответ, что и без --speakers: ярлыков в нём нет ни одного.
+        stub = _answering_stub(workdir, "без-ярлыков", _good_answer())
+        out = os.path.join(workdir, "саммари.md")
+
+        argv = ["--punctuated", source, "--speakers", speakers, "--roles", roles, "--out", out]
+        code, report, stderr = _run(argv, stub)
+        _check(code == 0, "ответ без ярлыков вернул код %d, ожидался 0" % code)
+
+        # Строки не выброшены: фрагмент такой же, как был бы без --speakers.
+        _check(_read(out) == PLAIN_FRAGMENT, "строки без ярлыка не попали во фрагмент")
+        _check(report_row("Домашних заданий", "2") in report, "в отчёте не те цифры:\n%s" % report)
+        for name in ("Домашние задания", "Решения, задачи, договорённости"):
+            _check(
+                "%s: в 2 строках claude не поставил ярлык" % name in stderr,
+                "про строки без ярлыка в «%s» не предупредили: %s" % (name, stderr),
+            )
+        # Про шесть остальных разделов такого предупреждения нет.
+        _check(stderr.count("не поставил ярлык") == 2,
+               "предупреждение ушло не в те разделы: %s" % stderr)
+
+        # Ярлык в одной строке из двух — предупреждение про одну.
+        half = _answering_stub(
+            workdir,
+            "половина",
+            _answer(
+                actions=(
+                    "- [00:10:00] Студент 1: Таймкод ставится на каждое предложение\n"
+                    "- [02:35:29] Задачи разошлись по исполнителям"
+                )
+            ),
+        )
+        out2 = os.path.join(workdir, "половина.md")
+        code, _, stderr = _run(
+            ["--punctuated", source, "--speakers", speakers, "--roles", roles, "--out", out2],
+            half,
+        )
+        _check(code == 0, "половина ярлыков вернула код %d" % code)
+        _check(
+            "Решения, задачи, договорённости: в 1 строках claude не поставил ярлык" in stderr,
+            "не то число строк без ярлыка: %s" % stderr,
+        )
+        _check(
+            parse_fragment(_read(out2))["actions"] == [
+                "- [00:10:00] Студент 1: Таймкод ставится на каждое предложение",
+                "- [02:35:29] Задачи разошлись по исполнителям",
+            ],
+            "строка без ярлыка выброшена из фрагмента",
+        )
+
+        # Чужой ярлык (такого говорящего в записи нет) за ярлык не сходит.
+        stranger = _answering_stub(
+            workdir, "чужой", _answer(actions="- [00:10:00] Студент 7: Так и не договорились")
+        )
+        out3 = os.path.join(workdir, "чужой.md")
+        code, _, stderr = _run(
+            ["--punctuated", source, "--speakers", speakers, "--roles", roles, "--out", out3],
+            stranger,
+        )
+        _check(code == 0, "чужой ярлык вернул код %d" % code)
+        _check("не поставил ярлык" in stderr, "про чужой ярлык не предупредили: %s" % stderr)
+        _check(
+            parse_fragment(_read(out3))["actions"]
+            == ["- [00:10:00] Студент 7: Так и не договорились"],
+            "строку с чужим ярлыком переписали",
+        )
+
+
+def _test_speakers_degraded() -> None:
+    """Негодные speakers/1 и roles/1: саммари по предложениям, предупреждение, код 0."""
+    with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
+        source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
+        good_speakers = _write_json(
+            os.path.join(workdir, "speakers.json"), _fixture_speakers()
+        )
+        no_speaker = _fixture_speakers()
+        for phrase in no_speaker["phrases"]:
+            phrase["speaker"] = None
+        broken = os.path.join(workdir, "broken.json")
+        write_text_file(broken, '{"schema": "speakers/1", "phrases": [')
+
+        bad_speakers: list[tuple[str, list[str]]] = []
+        for name, payload in (
+            ("не объект", []),
+            ("нет schema", {"phrases": []}),
+            ("чужая схема", dict(_fixture_speakers(), schema="speakers/2")),
+            ("нет phrases", {"schema": "speakers/1", "speakers": []}),
+            ("phrases пуст", {"schema": "speakers/1", "phrases": []}),
+            ("фраза не объект", {"schema": "speakers/1", "phrases": ["текст"]}),
+            (
+                "пустой текст фразы",
+                {"schema": "speakers/1", "phrases": [{"start": 0.0, "text": " ",
+                                                      "sentences": [0, 0]}]},
+            ),
+            (
+                "нет границ фразы",
+                {"schema": "speakers/1", "phrases": [{"start": 0.0, "text": "а"}]},
+            ),
+        ):
+            path = _write_json(os.path.join(workdir, "плохой-%s.json" % len(bad_speakers)), payload)
+            bad_speakers.append((name, ["--speakers", path]))
+        bad_speakers.append(("битый JSON", ["--speakers", broken]))
+        bad_speakers.append(("нет файла", ["--speakers", os.path.join(workdir, "нет.json")]))
+        bad_speakers.append(("каталог вместо файла", ["--speakers", workdir]))
+
+        for name, payload in (
+            ("чужая схема", dict(_fixture_roles(), schema="roles/2")),
+            ("нет roles", {"schema": "roles/1", "status": "ok"}),
+            ("роль не объект", {"schema": "roles/1", "roles": ["Преподаватель"]}),
+            ("пустая роль", {"schema": "roles/1", "roles": [{"speaker": "Говорящий 1",
+                                                             "role": " "}]}),
+        ):
+            path = _write_json(os.path.join(workdir, "роли-%s.json" % len(bad_speakers)), payload)
+            bad_speakers.append(
+                ("roles: %s" % name, ["--speakers", good_speakers, "--roles", path])
+            )
+
+        for number, (name, extra) in enumerate(bad_speakers):
+            stub = _answering_stub(workdir, "плохо-%d" % number, _good_answer())
+            out = os.path.join(workdir, "плохо-%d.md" % number)
+            code, _, stderr = _run(
+                ["--punctuated", source, "--out", out] + extra, stub
+            )
+            _check(code == 0, "случай %r вернул код %d, ожидался 0" % (name, code))
+            _check(stderr.strip() != "", "случай %r промолчал в stderr" % name)
+            # Работа по старому пути: промпт по предложениям, фрагмент прежний.
+            _check(
+                _prompt_of(stub).endswith(PLAIN_PROMPT_BODY),
+                "случай %r: промпт собран не по предложениям" % name,
+            )
+            _check(_read(out) == PLAIN_FRAGMENT, "случай %r: фрагмент изменился" % name)
+
+        # Годный speakers/1, в котором ни у одной фразы нет говорящего: фразы в
+        # промпте есть, ярлыков нет, и требования про ярлык в промпте тоже нет.
+        path = _write_json(os.path.join(workdir, "без-говорящих.json"), no_speaker)
+        stub = _answering_stub(workdir, "без-говорящих", _good_answer())
+        out = os.path.join(workdir, "без-говорящих.md")
+        code, _, stderr = _run(
+            ["--punctuated", source, "--speakers", path, "--out", out], stub
+        )
+        _check(code == 0, "speakers без говорящих вернул код %d" % code)
+        _check("ярлыков в саммари не будет" in stderr, "про отсутствие ярлыков не сказали")
+        prompt = _prompt_of(stub)
+        _check("Ярлык" not in prompt, "в промпте без говорящих осталось требование про ярлык")
+        _check(_read(out) == PLAIN_FRAGMENT, "фрагмент без говорящих изменился")
+
+        # Роли есть, но ни одна не про этих говорящих: ярлыками станут имена.
+        strangers = _write_json(
+            os.path.join(workdir, "чужие-роли.json"),
+            dict(
+                _fixture_roles(),
+                roles=[{"speaker": "Говорящий 9", "role": "Гость", "share": 1.0,
+                        "source": "claude"}],
+            ),
+        )
+        stub = _answering_stub(workdir, "чужие-роли", _good_answer())
+        out = os.path.join(workdir, "чужие-роли.md")
+        code, _, stderr = _run(
+            ["--punctuated", source, "--speakers", good_speakers, "--roles", strangers,
+             "--out", out],
+            stub,
+        )
+        _check(code == 0, "чужие роли вернули код %d" % code)
+        _check("ярлыками будут имена" in stderr, "про чужие роли не предупредили: %s" % stderr)
+        _check(
+            "[00:00:00] Говорящий 1: Добрый день" in _prompt_of(stub),
+            "при чужих ролях ярлыком стало не имя говорящего",
+        )
+
+
+def _test_without_speakers() -> None:
+    """Без --speakers промпт и фрагмент прежние — ни одного изменённого байта."""
+    with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
+        source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
+        stub = _answering_stub(workdir, "ок", _good_answer())
+        out = os.path.join(workdir, "саммари.md")
+
+        code, _, stderr = _run(["--punctuated", source, "--out", out], stub)
+        _check(code == 0, "прогон без --speakers вернул код %d" % code)
+        _check(not stderr.strip(), "прогон без --speakers сказал лишнее: %s" % stderr.strip())
+        _check(
+            _prompt_of(stub) == PROMPT_HEAD + PLAIN_PROMPT_BODY,
+            "промпт без --speakers изменился:\n%s" % _prompt_of(stub),
+        )
+        _check(_read(out) == PLAIN_FRAGMENT, "фрагмент без --speakers изменился:\n%s" % _read(out))
+        # Ни слова про ярлыки: ни в требованиях, ни в строках расшифровки.
+        for needle in ("Ярлык", "ярлык"):
+            _check(needle not in _prompt_of(stub), "в промпте без --speakers есть %r" % needle)
+        # Восьмого требования в таком промпте нет — их ровно семь.
+        _check("\n8. " not in _prompt_of(stub), "в промпте без --speakers появился пункт 8")
+        _check("\n7. " in _prompt_of(stub), "в промпте без --speakers пропал пункт 7")
+
+
 def _test_broken_input() -> None:
     """Непригодный вход: код 2, понятное сообщение, --out не создаётся."""
     bad = [
@@ -2175,6 +2842,8 @@ def _test_help() -> None:
         for needle in (
             "--punctuated",
             "--transcript",
+            "--speakers",
+            "--roles",
             "--out",
             "--timeout",
             "--attempts",
@@ -2191,6 +2860,12 @@ def _test_help() -> None:
             "как прозвучал в записи",
             "Пересчёт относительных сроков в даты промпт запрещает",
             "не прозвучало",
+            # Ярлыки говорящих: что делают два новых флага и где видны ярлыки.
+            "«[ЧЧ:ММ:СС] Ярлык: текст»",
+            "- [ЧЧ:ММ:СС] Преподаватель: задание — срок:",
+            "схемы speakers/1",
+            "схемы roles/1",
+            "без --speakers файл не используется",
         ):
             _check(needle in out, "в справке (%s) нет %r" % (flag, needle))
         # Все восемь разделов названы в справке.
@@ -2240,6 +2915,10 @@ def selftest() -> int:
         ("домашние задания: срок в строке и в разделе сроков", _test_homework),
         ("саммари не получено: пометка и код 1", _test_not_received),
         ("режим --transcript и приоритет --punctuated", _test_transcript_mode),
+        ("ярлыки говорящих в промпте и двух разделах", _test_speaker_labels),
+        ("claude не поставил ярлык: строки на месте", _test_labels_missing),
+        ("негодные speakers и roles: работа по старому пути", _test_speakers_degraded),
+        ("без --speakers промпт и фрагмент прежние", _test_without_speakers),
         ("непригодный вход и коды возврата", _test_broken_input),
         ("--log-dir: промпт и ответ на диске", _test_log_dir),
         ("справка", _test_help),
