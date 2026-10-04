@@ -451,15 +451,22 @@ def check_plan(
     (ValueError на длинном чанке) или дырой в расшифровке, и разбираться в ней
     было бы на порядок дороже, чем увидеть здесь.
     """
+    # Границы плана округлены до TIME_DIGITS, поэтому и с концом записи их
+    # сравниваем округлёнными — так же он записан в plan.json как source_duration.
+    # С сырой длительностью сравнивать нельзя: конец записи вне сетки миллисекунд
+    # (9329.6535 с на прогоне 2026-10-03) округляется вверх, и последний чанк
+    # «выходил» за запись на полмиллисекунды. Округление монотонно, так что
+    # граница внутри записи после него всё равно не больше limit.
+    limit = _round(duration)
     problems: list[str] = []
     previous_end = 0.0
     for chunk in chunks:
         where = f"чанк {chunk.index}"
         if chunk.end <= chunk.start:
             problems.append(f"{where}: end ({chunk.end}) не больше start ({chunk.start})")
-        if chunk.start < -EPS or chunk.end > duration + EPS:
+        if chunk.start < -EPS or chunk.end > limit + EPS:
             problems.append(
-                f"{where}: границы [{chunk.start}, {chunk.end}] вне записи [0, {duration}]"
+                f"{where}: границы [{chunk.start}, {chunk.end}] вне записи [0, {limit}]"
             )
         if chunk.start < previous_end - EPS:
             problems.append(
@@ -487,9 +494,9 @@ def check_plan(
     for item in dropped:
         if item.end < item.start - EPS:
             problems.append(f"выброшенный участок [{item.start}, {item.end}] вывернут")
-        if item.start < -EPS or item.end > duration + EPS:
+        if item.start < -EPS or item.end > limit + EPS:
             problems.append(
-                f"выброшенный участок [{item.start}, {item.end}] вне записи [0, {duration}]"
+                f"выброшенный участок [{item.start}, {item.end}] вне записи [0, {limit}]"
             )
         for chunk in chunks:
             overlap = min(chunk.end, item.end) - max(chunk.start, item.start)
@@ -1148,6 +1155,32 @@ def selftest() -> int:
         silences = [(float(t) + 0.3, float(t) + 1.9) for t in range(3, 90, 7)]
         chunks, dropped = plan_chunks(95.0, silences, noise_params)
         failures += _invariants(f"параметры {noise_params}", 95.0, chunks, dropped, noise_params)
+    cases_done += 1
+
+    # --- 10. Конец записи не на сетке миллисекунд ------------------------------
+    # Регрессия прогона 2026-10-03: длина WAV 16 кГц кратна 1/16000 с, и ffprobe
+    # дал 9329.6535 с. Конец последнего чанка округлился до 9329.654, а проверка
+    # сравнивала его с неокруглённой длительностью и отменяла всю нарезку.
+    duration = 9329.6535
+    check(
+        _round(duration) > duration,
+        f"конец вне сетки: {duration} больше не округляется вверх — случай ничего не проверяет",
+    )
+    params = _selftest_params(drop_pause=86400)
+    chunks, dropped = plan_chunks(duration, [], params)
+    failures += _invariants("конец вне сетки, без выброса", duration, chunks, dropped, params)
+    check(
+        chunks[-1].cut_reason == "end" and chunks[-1].end == _round(duration),
+        f"конец вне сетки: последний чанк кончается на {chunks[-1].end}, "
+        f"ожидалось {_round(duration)}",
+    )
+    params = _selftest_params()
+    chunks, dropped = plan_chunks(duration, [(duration - 4.0, duration)], params)
+    failures += _invariants("конец вне сетки, пауза в конце", duration, chunks, dropped, params)
+    check(
+        bool(dropped) and dropped[-1].end == _round(duration),
+        "конец вне сетки: выброшенная пауза не упирается в конец записи",
+    )
     cases_done += 1
 
     print(f"{PROG}: селф-тест, проверенных случаев: {cases_done}")
