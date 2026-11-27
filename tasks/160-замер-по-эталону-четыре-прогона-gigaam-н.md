@@ -1,6 +1,6 @@
 ---
 title: Замер по эталону: четыре прогона GigaAM на всей записи и отчёт reference-metrics.md
-verify: test -s "/Users/alexander/my projects/vidio_parser/data/reference-run/metrics/all.json" && test -s "/Users/alexander/my projects/vidio_parser/docs/analysis/reference-metrics.md" && python tools/score.py --selftest && python tools/align_timecodes.py --selftest
+verify: test -s "/Users/alexander/my projects/video_parser/data/reference-run/metrics/all.json" && test -s "/Users/alexander/my projects/video_parser/docs/analysis/reference-metrics.md" && python tools/score.py --selftest && python tools/align_timecodes.py --selftest
 verify_timeout: 300
 ---
 
@@ -20,8 +20,8 @@ verify_timeout: 300
 - [ ] Выполнены четыре прогона: `v3_rnnt` и `v3_e2e_rnnt`, каждый в режиме по умолчанию (паузы >2 с выбрасываются) и в режиме без выбрасывания; все четыре дали `transcript.json`, `.txt`, `.srt`, `time.txt`, `checks.json`
 - [ ] Веса взяты из `~/.cache/gigaam`, в сеть прогон не ходил, ничего не скачивалось
 - [ ] Для каждой из четырёх конфигураций посчитаны и сохранены: WER, WER с маскировкой чисел, CER, замены/удаления/вставки, медиана и максимум сдвига таймкодов, доля несопоставленных меток, число и доля ошибок на латинско-кириллических парах, время распознавания, ×RT, пик RSS, итог проверок таймкодов
-- [ ] Все числа собраны в `/Users/alexander/my projects/vidio_parser/data/reference-run/metrics/all.json` — один файл, из которого их можно перечитать без повторного прогона
-- [ ] Отчёт `/Users/alexander/my projects/vidio_parser/docs/analysis/reference-metrics.md` содержит: окружение и версии, SHA-256 входа, число слов в эталоне, сводную таблицу 4×метрики, сравнение двух режимов нарезки (сколько секунд выброшено и как это отразилось на удалениях и WER), сравнение двух чекпойнтов, топ пар ошибок «сказано → распознано» и разбор латинско-кириллических пар
+- [ ] Все числа собраны в `/Users/alexander/my projects/video_parser/data/reference-run/metrics/all.json` — один файл, из которого их можно перечитать без повторного прогона
+- [ ] Отчёт `/Users/alexander/my projects/video_parser/docs/analysis/reference-metrics.md` содержит: окружение и версии, SHA-256 входа, число слов в эталоне, сводную таблицу 4×метрики, сравнение двух режимов нарезки (сколько секунд выброшено и как это отразилось на удалениях и WER), сравнение двух чекпойнтов, топ пар ошибок «сказано → распознано» и разбор латинско-кириллических пар
 - [ ] В отчёте явно сказано, что эталон обрабатывался нейросетью для суммаризации и не выверен дословно (числа цифрами, латиница, нет запинок и ни одного `[нрзб]`), поэтому полученный WER — верхняя оценка ошибки модели, несопоставимая с публичными WER из `docs/research/asr-models.md`
 - [ ] В отчёте сказано, какие условия §5 протокола соблюсти не удалось (например, пара «холодный/тёплый» прогон) и почему это не влияет на выводы по качеству
 - [ ] Файл эталона и исходная запись не изменены; ничего из `vidio_example/` и `data/` в индекс git не добавлено
@@ -38,10 +38,10 @@ verify_timeout: 300
 • эталон и расшифровки остаются вне git; сам отчёт в git тоже не коммитится, поэтому обезличивать примеры ошибок в нём не требуется — в репозиторий пойдут только числа (это делает следующая задача в `benchmark-plan.md`).
 
 Пути (оба каталога закрыты корневым `.gitignore`, в git-worktree их нет — обращаться по абсолютному пути основного рабочего каталога, в путях есть пробелы, кавычки обязательны):
-• эталон: `/Users/alexander/my projects/vidio_parser/vidio_example/reference/Созвон 02.10 Тигран Саша Стас Сема.txt` (110 строк `[ММ:СС] Роль: текст`);
-• запись: `/Users/alexander/my projects/vidio_parser/vidio_example/reference/Запись встречи 02.10.2026 15_12_36.webm`;
-• все артефакты прогона: `/Users/alexander/my projects/vidio_parser/data/reference-run/` — предлагаемая раскладка `full/` (WAV), `drop/` и `keep/` (по одному прогону скрипта на режим, внутри — `plan.json`, каталоги моделей, `summary.md`), `metrics/`, `logs/`;
-• отчёт писать сразу по абсолютному пути `/Users/alexander/my projects/vidio_parser/docs/analysis/reference-metrics.md`: файл не версионируется, и из worktree он бы просто потерялся.
+• эталон: `/Users/alexander/my projects/video_parser/vidio_example/reference/Созвон 02.10 Тигран Саша Стас Сема.txt` (110 строк `[ММ:СС] Роль: текст`);
+• запись: `/Users/alexander/my projects/video_parser/vidio_example/reference/Запись встречи 02.10.2026 15_12_36.webm`;
+• все артефакты прогона: `/Users/alexander/my projects/video_parser/data/reference-run/` — предлагаемая раскладка `full/` (WAV), `drop/` и `keep/` (по одному прогону скрипта на режим, внутри — `plan.json`, каталоги моделей, `summary.md`), `metrics/`, `logs/`;
+• отчёт писать сразу по абсолютному пути `/Users/alexander/my projects/video_parser/docs/analysis/reference-metrics.md`: файл не версионируется, и из worktree он бы просто потерялся.
 
 Как прогонять. Полный WAV: `bash scripts/make_sample.sh --input "<запись>" --outdir "<...>/data/reference-run/full" --start 0 --duration 99999` — скрипт сам обрежет длительность до фактической, напечатает длительность и SHA-256 (заодно создаст короткий mp4, он не мешает). Прогон: `bash scripts/transcribe_gigaam.sh --input "<полный wav>" --outdir "<...>/data/reference-run/drop" --skip-prepare` и то же с `--keep-pauses` в `.../keep`; обе модели скрипт прогоняет сам, последовательно, снимает время и пик RSS через `/usr/bin/time -l`, рендерит `.txt`/`.srt` и прогоняет проверки таймкодов. `--skip-prepare` обязателен, чтобы скрипт случайно не начал готовить фрагмент лекции. Лог: `… 2>&1 | tee "<...>/data/reference-run/logs/run-drop-$(date +%Y%m%d-%H%M%S).log"`.
 

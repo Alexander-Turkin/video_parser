@@ -2,7 +2,7 @@
   "extraAllow": [
     "Bash(bash scripts/*)",
     "Bash(bash -n scripts/*)",
-    "Bash(bash \"/Users/alexander/my projects/vidio_parser/scripts/*)",
+    "Bash(bash \"/Users/alexander/my projects/video_parser/scripts/*)",
     "Bash(./scripts/*)",
     "Bash(scripts/*)",
     "Bash(ffmpeg *)",

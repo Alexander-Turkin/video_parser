@@ -1,4 +1,4 @@
-cd "/Users/alexander/my projects/vidio_parser" && bash scripts/inspect_media.sh "vidio_example/Лекция 1 01.09.26 (1).webm" --frames /tmp/lecture-frames --frames-count 5
+cd "/Users/alexander/my projects/video_parser" && bash scripts/inspect_media.sh "vidio_example/Лекция 1 01.09.26 (1).webm" --frames /tmp/lecture-frames --frames-count 5
 
 ================ ИНСПЕКЦИЯ МЕДИАФАЙЛА ================
 Файл:      vidio_example/Лекция 1 01.09.26 (1).webm
@@ -57,7 +57,7 @@ EBU R128 true peak:    0.1 dBFS
   /tmp/lecture-frames/frame_05_7774.709s.png  (t=02:09:34.709, 7774.709 с)
 
 ================ КОНЕЦ ОТЧЁТА ================
-alexander@MacBook-Air-Alexander vidio_parser % cd "/Users/alexander/my projects/vidio_parser" && bash scripts/inspect_media.sh "vidio_example/Лекция 1 01.09.26 (1).webm"
+alexander@MacBook-Air-Alexander video_parser % cd "/Users/alexander/my projects/video_parser" && bash scripts/inspect_media.sh "vidio_example/Лекция 1 01.09.26 (1).webm"
 
 ================ ИНСПЕКЦИЯ МЕДИАФАЙЛА ================
 Файл:      vidio_example/Лекция 1 01.09.26 (1).webm
