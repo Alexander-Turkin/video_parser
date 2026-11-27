@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""punctuate.py — пунктуация расшифровки окнами через claude и предложения с таймкодами.
+"""punctuate.py — пунктуация расшифровки окнами через ollama и предложения с таймкодами.
 
 На вход — транскрипт схемы transcript/1 от tools/transcribe.py: сплошной поток
 строчными без точек, числа словами (так говорит выбранная модель GigaAM v3_rnnt).
-На выход — файл схемы punctuated/1: тот же текст, которому claude расставил
+На выход — файл схемы punctuated/1: тот же текст, которому ollama расставил
 знаки препинания, заглавные и абзацы, разбитый на предложения, и у каждого
 предложения таймкод начала и конца из пословных таймкодов транскрипта.
 
-Главное правило, из которого вырос весь инструмент: claude не имеет права менять
+Главное правило, из которого вырос весь инструмент: ollama не имеет права менять
 слова. Он ставит пунктуацию, меняет регистр и расставляет абзацы — и всё. Поэтому
 после каждого ответа последовательность слов сверяется с исходной, и расхождение
 не «исправляется», а откатывает окно целиком: в файл идёт дословный текст модели
@@ -17,25 +17,25 @@
 обязана остаться расшифровкой, а таймкоды — соответствовать словам.
 
 Почему окнами. Полная запись — это десятки тысяч слов, в один промпт они не
-влезают (промпт идёт аргументом командной строки, предел считает claude_cli).
-Решение владельца: окна по ~100 сегментов, склейка строго по порядку окон. В
+не помещаются в контекст модели. По умолчанию используются окна по 25
+сегментов, которые склеиваются строго по порядку. В
 промпт каждого окна добавляется последнее предложение предыдущего — как контекст
 с пометкой «не выводить», чтобы пунктуация на стыке не рвалась.
 
 Откуда берутся таймкоды предложений. Слова окна выкладываются в один плоский
 список: у сегмента с пословными таймкодами берутся они, у сегмента без них —
 границы самого сегмента (так бывает с пустыми и короткими чанками). Поскольку
-последовательность слов в ответе claude уже сверена и совпадает слово в слово,
+последовательность слов в ответе ollama уже сверена и совпадает слово в слово,
 k-е слово ответа — это k-е слово списка: start предложения — время первого его
 слова, end — конец последнего. Времена слов зажимаются в границы их сегментов, а
 предложения — в [0, source_duration], и порядок не убывает.
 
 Чего инструмент не делает: не ходит за саммари (tools/summarize.py), не собирает
 итоговый .md (tools/render_doc.py), не чинит ошибки распознавания и не вызывает
-claude повторно ради лучшей пунктуации. Вызов claude живёт только в
-tools/claude_cli.py, своего subprocess здесь нет.
+ollama повторно ради лучшей пунктуации. Вызов ollama живёт только в
+tools/ollama_client.py, своего subprocess здесь нет.
 
-Зависимости: стандартная библиотека плюс два соседних модуля (claude_cli для
+Зависимости: стандартная библиотека плюс два соседних модуля (ollama_client для
 вызова, outputs для разбора транскрипта). Ни torch, ни gigaam, ни ffmpeg здесь не
 нужны — весам моделей взяться неоткуда и незачем. Проверки живут в самом файле
 (--selftest): pytest в окружении проекта нет.
@@ -58,14 +58,14 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# claude_cli.py и outputs.py лежат рядом, а tools/ — не пакет: при запуске
+# ollama_client.py и outputs.py лежат рядом, а tools/ — не пакет: при запуске
 # «python tools/punctuate.py» каталог скрипта уже первый в sys.path, но при
 # импорте модуля откуда-то ещё — нет. Поэтому путь добавляется явно.
 _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-import claude_cli  # noqa: E402 — импорт возможен только после правки sys.path выше
+import ollama_client  # noqa: E402 — импорт возможен только после правки sys.path выше
 import outputs  # noqa: E402 — то же самое
 
 PROG = "punctuate.py"
@@ -77,16 +77,16 @@ SCHEMA = "punctuated/1"
 # Схема входа — та же константа, что у tools/outputs.py и tools/transcribe.py.
 TRANSCRIPT_SCHEMA = outputs.SCHEMA
 
-# Сегменты транскрипта — это чанки нарезки по 20–25 с, то есть окно в 100
-# сегментов это примерно 40 минут речи. Решение владельца: окна по ~100 сегментов.
-DEFAULT_WINDOW = 100
+# Сегменты транскрипта — чанки по 20–25 с. Окно в 25 сегментов
+# помещается в контекст локальной модели и проверяется целиком.
+DEFAULT_WINDOW = 25
 
 # Сколько знаков после запятой остаётся у секунд в файле. Транскрипт приходит с
 # точностью до миллисекунды, выдумывать точнее нечего.
 ROUND_TO = 3
 
 # Разделитель в промпте, после которого идёт текст окна и ничего больше. Нужен
-# по двум причинам: claude видит, где кончаются правила, а селф-тест может
+# по двум причинам: ollama видит, где кончаются правила, а селф-тест может
 # вытащить из промпта ровно отправленный текст.
 TEXT_MARKER = "=== ТЕКСТ ОКНА ==="
 
@@ -103,8 +103,8 @@ class InputError(Exception):
     """Вход непригоден: нет файла, не та схема, нет сегментов."""
 
 
-class ClaudeGone(Exception):
-    """claude недоступен совсем: остальные окна звать его уже бессмысленно."""
+class OllamaGone(Exception):
+    """ollama недоступен совсем: остальные окна звать его уже бессмысленно."""
 
 
 def die(message: str, code: int = 2) -> int:
@@ -127,36 +127,37 @@ HELP = """Использование:
   python tools/punctuate.py --transcript <файл.json> --out <файл.json> [опции]
   python tools/punctuate.py --selftest
 
-Расставляет в расшифровке пунктуацию, заглавные и абзацы силами claude, не меняя
+Расставляет в расшифровке пунктуацию, заглавные и абзацы силами ollama, не меняя
 ни одного слова, и пишет файл схемы %s: предложения с таймкодами
-начала и конца, абзацы и окна обработки. Текст уходит в claude окнами по
+начала и конца, абзацы и окна обработки. Текст уходит в ollama окнами по
 --window сегментов, по порядку и без перекрытия; после каждого ответа
 последовательность слов сверяется с транскриптом. Если слова не совпали или
-claude не ответил, окно откатывается к дословному тексту модели без пунктуации,
+ollama не ответил, окно откатывается к дословному тексту модели без пунктуации,
 помечается в файле и даёт ненулевой код возврата.
 
 Опции:
   --transcript <файл>   JSON схемы %s от tools/transcribe.py (обязателен)
   --out <файл>          куда записать JSON схемы %s (обязателен)
+  --ollama-model <имя>  локальная модель (по умолчанию qwen3:8b)
   --window <N>          сколько сегментов отправлять в одном окне
                         (по умолчанию %d)
-  --timeout <сек>       сколько ждать ответа claude на одно окно
+  --timeout <сек>       сколько ждать ответа ollama на одно окно
                         (по умолчанию %g)
   --attempts <N>        сколько попыток делать на одно окно (по умолчанию %d;
                         повтор бывает только на таймауте и ненулевом коде)
-  --log-dir <каталог>   куда складывать промпты и ответы claude
-                        (через tools/claude_cli.py, по файлу на вызов)
+  --log-dir <каталог>   куда складывать промпты и ответы ollama
+                        (через tools/ollama_client.py, по файлу на вызов)
   --selftest            прогнать встроенные проверки и выйти (установленный
-                        claude и веса моделей не нужны)
+                        ollama и веса моделей не нужны)
   -h, --help            показать эту справку
 
-Вызов claude собирается только в tools/claude_cli.py: `claude -p <промпт>` с
-моделью по умолчанию. Если claude не найден или не авторизован, файл всё равно
+Вызов ollama собирается только в tools/ollama_client.py: локальный HTTP API 127.0.0.1:11434 с
+моделью qwen3:8b по умолчанию. Если Ollama или выбранная модель недоступна, файл всё равно
 записывается — целиком из дословного текста модели, с пометками в каждом окне.
 
 Коды возврата:
   0  все окна прошли сверку слов
-  1  есть окна в откате (слова не совпали, claude не ответил или недоступен);
+  1  есть окна в откате (слова не совпали, ollama не ответил или недоступен);
      файл записан и валиден
   2  вход непригоден (нет файла, не та схема, нет сегментов) — --out не создаётся
 
@@ -164,14 +165,14 @@ claude не ответил, окно откатывается к дословн�
   python tools/punctuate.py --transcript data/output/созвон/transcript.json \\
       --out data/output/созвон/punctuated.json
   python tools/punctuate.py --transcript t.json --out p.json --window 60 \\
-      --log-dir data/output/созвон/claude
+      --log-dir data/output/созвон/ollama
 """ % (
     SCHEMA,
     TRANSCRIPT_SCHEMA,
     SCHEMA,
     DEFAULT_WINDOW,
-    claude_cli.DEFAULT_TIMEOUT,
-    claude_cli.DEFAULT_ATTEMPTS,
+    ollama_client.DEFAULT_TIMEOUT,
+    ollama_client.DEFAULT_ATTEMPTS,
 )
 
 
@@ -228,7 +229,7 @@ def normalize_word(token: str) -> str:
 
     Нижний регистр, ё→е, выкидывается всё, кроме букв и цифр. Именно в таком
     виде сравниваются обе последовательности: пунктуация и заглавные — это
-    разрешённые claude правки, а состав слов — нет. «Привет!» и «привет» равны,
+    разрешённые ollama правки, а состав слов — нет. «Привет!» и «привет» равны,
     «ещё» и «еще» равны, а «двадцать пять» и «25» — уже нет.
     """
     lowered = token.lower().replace("ё", "е")
@@ -278,7 +279,7 @@ SENTENCE_BOUNDARY_RE = re.compile(
     r"[.!?…]+[»\"'”’)\]]*\s+(?=[«\"'“‘(\[]*[0-9A-ZА-ЯЁ])"
 )
 
-# Абзацы в ответе claude разделены пустой строкой — так и просит промпт.
+# Абзацы в ответе ollama разделены пустой строкой — так и просит промпт.
 PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t]*\n+")
 
 
@@ -292,9 +293,9 @@ def split_sentences(paragraph: str) -> list[str]:
 
     Внутренние переводы строк и повторные пробелы сжимаются в один пробел:
     абзац в итоговом документе — это строки предложений, и переносы из ответа
-    claude в них не нужны. Кусок без букв и цифр отдельным предложением не
+    ollama в них не нужны. Кусок без букв и цифр отдельным предложением не
     становится, но и не теряется: он прирастает к соседнему — иначе сверка слов
-    увидела бы расхождение там, где претензий к claude нет.
+    увидела бы расхождение там, где претензий к ollama нет.
     """
     text = " ".join(paragraph.split())
     if not text:
@@ -320,7 +321,7 @@ def split_sentences(paragraph: str) -> list[str]:
 
 
 def split_paragraphs(answer: str) -> list[list[str]]:
-    """Ответ claude -> абзацы, каждый из предложений. Пустые абзацы выпадают."""
+    """Ответ ollama -> абзацы, каждый из предложений. Пустые абзацы выпадают."""
     paragraphs = []
     for block in PARAGRAPH_SPLIT_RE.split(answer.strip()):
         sentences = split_sentences(block)
@@ -517,10 +518,11 @@ def process_window(
     timeout: float,
     attempts: int,
     log_dir: str | None,
+    model: str = ollama_client.DEFAULT_MODEL,
 ) -> WindowResult:
-    """Одно окно: промпт, вызов claude, сверка слов и таймкоды.
+    """Одно окно: промпт, вызов ollama, сверка слов и таймкоды.
 
-    Поднимает ClaudeGone, если claude недоступен совсем (нет бинарника, не
+    Поднимает OllamaGone, если ollama недоступен совсем (нет бинарника, не
     авторизован) — звать его по следующим окнам в таком прогоне бессмысленно.
     Любая другая неудача и любое расхождение слов превращаются в откат окна, а
     не в исключение: остальные окна обрабатываются как обычно.
@@ -538,18 +540,19 @@ def process_window(
 
     prompt = build_prompt(window.text, previous_sentence)
     try:
-        answer = claude_cli.ask(
+        answer = ollama_client.ask(
             prompt,
+            model=model,
             timeout=timeout,
             attempts=attempts,
             log_dir=log_dir,
             tag="окно%03d" % window.index,
         )
-    except claude_cli.ClaudeUnavailable as exc:
-        raise ClaudeGone(str(exc)) from None
-    except claude_cli.ClaudeFailed as exc:
-        warn("окно %d: claude не ответил: %s" % (window.index, exc))
-        return verbatim_result(window, "claude не ответил: %s" % exc)
+    except ollama_client.OllamaUnavailable as exc:
+        raise OllamaGone(str(exc)) from None
+    except ollama_client.OllamaFailed as exc:
+        warn("окно %d: ollama не ответил: %s" % (window.index, exc))
+        return verbatim_result(window, "ollama не ответил: %s" % exc)
 
     paragraphs = split_paragraphs(answer)
     produced = tokenize(" ".join(
@@ -562,7 +565,7 @@ def process_window(
         position, was, now = mismatch
         sys.stderr.write(
             "%s: окно %d: слова не совпали с транскриптом на позиции %d: «%s» → «%s» "
-            "(слов в транскрипте %d, в ответе claude %d)\n"
+            "(слов в транскрипте %d, в ответе ollama %d)\n"
             % (PROG, window.index, position, was, now, len(reference), len(produced))
         )
         return verbatim_result(
@@ -709,18 +712,19 @@ def punctuate(
     timeout: float,
     attempts: int,
     log_dir: str | None,
+    model: str = ollama_client.DEFAULT_MODEL,
 ) -> list[WindowResult]:
     """Проходит окна по порядку, передавая следующему контекст предыдущего."""
-    available, detail = claude_cli.available()
+    available, detail = ollama_client.available(model)
     gone: str | None = None if available else detail
     if gone is not None:
-        warn("claude недоступен (%s) — пунктуации не будет, в файл пойдёт дословный текст" % gone)
+        warn("ollama недоступен (%s) — пунктуации не будет, в файл пойдёт дословный текст" % gone)
 
     results: list[WindowResult] = []
     previous_sentence: str | None = None
     for window in windows:
         if gone is not None:
-            results.append(verbatim_result(window, "claude недоступен: %s" % gone))
+            results.append(verbatim_result(window, "ollama недоступен: %s" % gone))
         else:
             try:
                 result = process_window(
@@ -729,13 +733,14 @@ def punctuate(
                     timeout=timeout,
                     attempts=attempts,
                     log_dir=log_dir,
+                    model=model,
                 )
-            except ClaudeGone as exc:
+            except OllamaGone as exc:
                 gone = str(exc)
                 warn(
-                    "claude недоступен (%s) — остальные окна остаются без пунктуации" % gone
+                    "ollama недоступен (%s) — остальные окна остаются без пунктуации" % gone
                 )
-                result = verbatim_result(window, "claude недоступен: %s" % gone)
+                result = verbatim_result(window, "ollama недоступен: %s" % gone)
             results.append(result)
         if results[-1].last_sentence:
             previous_sentence = results[-1].last_sentence
@@ -827,6 +832,7 @@ _FLAGS_VALUE = {
     "--timeout": "timeout",
     "--attempts": "attempts",
     "--log-dir": "log_dir",
+    "--ollama-model": "ollama_model",
 }
 
 
@@ -840,9 +846,10 @@ def parse_args(argv: list[str]) -> dict:
         "transcript": None,
         "out": None,
         "window": DEFAULT_WINDOW,
-        "timeout": claude_cli.DEFAULT_TIMEOUT,
-        "attempts": claude_cli.DEFAULT_ATTEMPTS,
+        "timeout": ollama_client.DEFAULT_TIMEOUT,
+        "attempts": ollama_client.DEFAULT_ATTEMPTS,
         "log_dir": None,
+        "ollama_model": ollama_client.DEFAULT_MODEL,
         "help": False,
         "selftest": False,
     }
@@ -928,19 +935,19 @@ def check_args(opts: dict) -> None:
 
 # ------------------------------------------------------------- селф-тест ---
 #
-# Установленный claude здесь не нужен и намеренно не используется: все вызовы
-# идут на подставной claude — скрипт на PATH, который механически расставляет
+# Установленный ollama здесь не нужен и намеренно не используется: все вызовы
+# идут на подставной ollama — скрипт на PATH, который механически расставляет
 # точки и заглавные, а по указанию из mode.txt портит слова. Так проверяется и
-# удачное окно, и каждый вид расхождения, и полное отсутствие claude.
+# удачное окно, и каждый вид расхождения, и полное отсутствие ollama.
 
-# Заглушка — это пара файлов: исполняемый `claude` на /bin/sh и питонья начинка
+# Заглушка — это пара файлов: исполняемый `ollama` на /bin/sh и питонья начинка
 # рядом с ним. Шебанг с путём к интерпретатору здесь не годится: путь к проекту
 # может содержать пробел (а он содержит), и ядро разорвало бы шебанг по нему.
 # Обёртка же запускает интерпретатор по абсолютному пути в кавычках, а каталог
 # берёт подстановкой оболочки ${0%/*} — внешних команд вроде dirname не нужно,
 # часть проверок подменяет PATH целиком.
 _STUB_WRAPPER = '''#!/bin/sh
-exec "%(python)s" "${0%%/*}/claude.py" "$@"
+exec "%(python)s" "${0%%/*}/ollama.py" "$@"
 '''
 
 # Промпт каждого вызова сохраняется рядом с заглушкой — по нему проверяется и
@@ -972,7 +979,7 @@ def main():
     elif mode == "потерять слово" and len(words) > 1:
         del words[1]
     elif mode == "ненулевой код":
-        sys.stderr.write("подставной claude: так и было задумано\\n")
+        sys.stderr.write("подставной ollama: так и было задумано\\n")
         sys.exit(9)
 
     sentences = []
@@ -1017,6 +1024,10 @@ def _check(condition: object, message: str) -> None:
 @contextmanager
 def _env(**values: str | None):
     """Временно правит os.environ: None — убрать переменную."""
+    # Existing CLI fixtures are used only inside this self-test.
+    if "PATH" in values and "OLLAMA_BIN" in values:
+        values["OLLAMA_TEST_BIN"] = os.path.join(values["PATH"].split(os.pathsep)[0], "ollama")
+        values.pop("OLLAMA_BIN")
     saved = {name: os.environ.get(name) for name in values}
     try:
         for name, value in values.items():
@@ -1034,13 +1045,13 @@ def _env(**values: str | None):
 
 
 def _make_stub(root: Path, modes: list[str]) -> Path:
-    """Создаёт каталог с подставным claude и файлом режимов. Возвращает каталог."""
-    directory = root / "подставной-claude"
+    """Создаёт каталог с подставным ollama и файлом режимов. Возвращает каталог."""
+    directory = root / "подставной-ollama"
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "claude.py").write_text(
+    (directory / "ollama.py").write_text(
         _STUB_SOURCE % {"marker": TEXT_MARKER}, encoding="utf-8"
     )
-    stub = directory / "claude"
+    stub = directory / "ollama"
     stub.write_text(_STUB_WRAPPER % {"python": sys.executable}, encoding="utf-8")
     stub.chmod(0o755)
     (directory / "mode.txt").write_text("\n".join(modes) + "\n", encoding="utf-8")
@@ -1048,7 +1059,7 @@ def _make_stub(root: Path, modes: list[str]) -> Path:
 
 
 def _stub_prompts(directory: Path) -> list[str]:
-    """Промпты всех вызовов подставного claude, по порядку."""
+    """Промпты всех вызовов подставного ollama, по порядку."""
     return [
         path.read_text(encoding="utf-8")
         for path in sorted(directory.glob("prompt-*.txt"))
@@ -1267,9 +1278,9 @@ def _test_successful_run() -> None:
         transcript = _fixture_transcript()
         path = _write_json(root / "transcript.json", transcript)
         out = str(root / "итог прогона" / "punctuated.json")
-        logs = str(root / "логи claude")
+        logs = str(root / "логи ollama")
 
-        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None):
+        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None):
             code, report, stderr = _run(
                 ["--transcript", path, "--out", out, "--window", "3", "--log-dir", logs]
             )
@@ -1313,7 +1324,7 @@ def _test_successful_run() -> None:
         _check(payload["paragraphs"] and len(payload["paragraphs"]) >= 4,
                "абзацев всего %d" % len(payload["paragraphs"]))
         # В одном окне больше одного абзаца — значит пустая строка в ответе
-        # claude действительно превратилась в абзац.
+        # ollama действительно превратилась в абзац.
         by_window: dict[int, int] = {}
         for paragraph in payload["paragraphs"]:
             by_window[paragraph["window"]] = by_window.get(paragraph["window"], 0) + 1
@@ -1341,7 +1352,7 @@ def _test_successful_run() -> None:
 
         # Промпт: правила, запреты и контекст предыдущего окна с пометкой.
         prompts = _stub_prompts(stub_dir)
-        _check(len(prompts) == 3, "вызовов claude было %d, а окон 3" % len(prompts))
+        _check(len(prompts) == 3, "вызовов ollama было %d, а окон 3" % len(prompts))
         for needle in (
             "менять слова",
             "добавлять слова",
@@ -1381,7 +1392,7 @@ def _test_successful_run() -> None:
             "в промпте второго окна не дословный текст его сегментов",
         )
 
-        # --log-dir: промпты и ответы сложены через claude_cli.
+        # --log-dir: промпты и ответы сложены через ollama_client.
         names = sorted(os.listdir(logs))
         _check(len(names) == 6, "в каталоге логов %d файлов, а вызовов 3: %r" % (len(names), names))
         _check(
@@ -1400,7 +1411,7 @@ def _test_changed_word() -> None:
         path = _write_json(root / "transcript.json", transcript)
         out = str(root / "punctuated.json")
 
-        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None):
+        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None):
             code, report, stderr = _run(
                 ["--transcript", path, "--out", out, "--window", "3"]
             )
@@ -1458,14 +1469,14 @@ def _test_invented_words() -> None:
 
         cases = [
             ("добавить слова", "лишние слова в конце"),
-            ("приписка", "вступление от claude"),
+            ("приписка", "вступление от ollama"),
             ("потерять слово", "пропавшее слово"),
         ]
         for mode, what in cases:
             stub_dir = _make_stub(root / mode, [mode])
             out = str(root / ("punctuated-%s.json" % mode))
             with _env(
-                PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None
+                PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None
             ):
                 code, _, stderr = _run(["--transcript", path, "--out", out, "--window", "2"])
             _check(code == 1, "случай %r вернул код %d, ожидался 1" % (what, code))
@@ -1493,8 +1504,8 @@ def _test_invented_words() -> None:
                 )
 
 
-def _test_claude_failure() -> None:
-    """Ненулевой код claude по окну — тоже откат, а не падение инструмента."""
+def _test_ollama_failure() -> None:
+    """Ненулевой код ollama по окну — тоже откат, а не падение инструмента."""
     with tempfile.TemporaryDirectory(prefix="punctuate-selftest-") as workdir:
         root = Path(workdir)
         stub_dir = _make_stub(root, ["ненулевой код", "ок"])
@@ -1502,29 +1513,29 @@ def _test_claude_failure() -> None:
         path = _write_json(root / "transcript.json", transcript)
         out = str(root / "punctuated.json")
 
-        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None):
+        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None):
             # --attempts 1: повторять заведомо падающую заглушку незачем, а пауза
-            # между попытками живёт в claude_cli и съела бы время селф-теста.
+            # между попытками живёт в ollama_client и съела бы время селф-теста.
             code, report, stderr = _run(
                 ["--transcript", path, "--out", out, "--window", "2", "--attempts", "1"]
             )
-        _check(code == 1, "неответивший claude дал код %d, ожидался 1" % code)
+        _check(code == 1, "неответивший ollama дал код %d, ожидался 1" % code)
 
         payload = _read_json(out)
         _validate_payload(payload, transcript, path)
         statuses = [window["status"] for window in payload["windows"]]
         _check(statuses == ["fallback", "ok"], "статусы окон: %r" % statuses)
         _check(
-            "claude не ответил" in payload["windows"][0]["reason"],
-            "причина отката не про неответивший claude: %r" % payload["windows"][0]["reason"],
+            "ollama не ответил" in payload["windows"][0]["reason"],
+            "причина отката не про неответивший ollama: %r" % payload["windows"][0]["reason"],
         )
-        _check("код 9" in payload["windows"][0]["reason"], "в причине нет кода возврата claude")
+        _check("код 9" in payload["windows"][0]["reason"], "в причине нет кода возврата ollama")
         _check("окно 0" in stderr, "в stderr нет номера неудачного окна: %s" % stderr)
         _check("В откате:      1" in report, "в отчёте не одно окно в откате")
 
 
-def _test_no_claude() -> None:
-    """claude нет вовсе: все окна в откате, файл записан и валиден, код 1."""
+def _test_no_ollama() -> None:
+    """ollama нет вовсе: все окна в откате, файл записан и валиден, код 1."""
     with tempfile.TemporaryDirectory(prefix="punctuate-selftest-") as workdir:
         root = Path(workdir)
         empty = root / "пустой-path"
@@ -1533,24 +1544,24 @@ def _test_no_claude() -> None:
         path = _write_json(root / "transcript.json", transcript)
         out = str(root / "punctuated.json")
 
-        with _env(PATH=str(empty), CLAUDE_BIN=None):
+        with _env(PATH=str(empty), OLLAMA_BIN=None):
             code, report, stderr = _run(
                 ["--transcript", path, "--out", out, "--window", "3"]
             )
-        _check(code == 1, "без claude код возврата %d, ожидался 1" % code)
-        _check(os.path.isfile(out), "без claude файл не записан")
+        _check(code == 1, "без ollama код возврата %d, ожидался 1" % code)
+        _check(os.path.isfile(out), "без ollama файл не записан")
 
         payload = _read_json(out)
         _validate_payload(payload, transcript, path)
         _check(
             all(window["status"] == "fallback" for window in payload["windows"]),
-            "без claude не все окна в откате: %r" % payload["windows"],
+            "без ollama не все окна в откате: %r" % payload["windows"],
         )
         for window in payload["windows"]:
-            _check("недоступен" in window["reason"], "причина не про недоступность claude")
+            _check("недоступен" in window["reason"], "причина не про недоступность ollama")
         _check(
             all(sentence["fallback"] for sentence in payload["sentences"]),
-            "без claude есть предложения без флага fallback",
+            "без ollama есть предложения без флага fallback",
         )
         # Каждый сегмент стал предложением со своим таймкодом, текст дословный.
         _check(
@@ -1563,31 +1574,31 @@ def _test_no_claude() -> None:
             _check(sentence["start"] == segment["start"], "таймкод не от сегмента")
         _check(
             _file_words(payload) == _transcript_words(transcript),
-            "без claude слова разъехались с транскриптом",
+            "без ollama слова разъехались с транскриптом",
         )
         _check("В откате:      3" in report, "в отчёте не три окна в откате")
-        _check("claude недоступен" in stderr, "про недоступность claude не предупредили")
+        _check("ollama недоступен" in stderr, "про недоступность ollama не предупредили")
 
-        # Не авторизованный claude — тот же исход: оставшиеся окна не вызываются.
+        # Не авторизованный ollama — тот же исход: оставшиеся окна не вызываются.
         auth_dir = root / "неавторизованный"
         auth_dir.mkdir()
-        stub = auth_dir / "claude"
+        stub = auth_dir / "ollama"
         stub.write_text(
             "#!/bin/sh\nprintf 'Invalid API key · Please run /login\\n' >&2\nexit 1\n",
             encoding="utf-8",
         )
         stub.chmod(0o755)
         out2 = str(root / "punctuated-auth.json")
-        with _env(PATH="%s%s%s" % (auth_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None):
+        with _env(PATH="%s%s%s" % (auth_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None):
             code, _, stderr = _run(
                 ["--transcript", path, "--out", out2, "--window", "3", "--attempts", "1"]
             )
-        _check(code == 1, "неавторизованный claude дал код %d" % code)
+        _check(code == 1, "неавторизованный ollama дал код %d" % code)
         payload = _read_json(out2)
         _validate_payload(payload, transcript, path)
         _check(
             all(window["status"] == "fallback" for window in payload["windows"]),
-            "при неавторизованном claude не все окна в откате",
+            "при неавторизованном ollama не все окна в откате",
         )
         _check("не авторизован" in stderr, "про неавторизованность не сказали: %s" % stderr)
 
@@ -1680,7 +1691,7 @@ def _test_window_edges() -> None:
         path = _write_json(root / "transcript.json", transcript)
         environment = {
             "PATH": "%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]),
-            "CLAUDE_BIN": None,
+            "OLLAMA_BIN": None,
         }
 
         # Окно больше, чем сегментов: одно окно на всю запись.
@@ -1702,7 +1713,7 @@ def _test_window_edges() -> None:
         _validate_payload(payload, transcript, path)
         _check(len(payload["windows"]) == 3, "окон %d вместо трёх" % len(payload["windows"]))
 
-        # Пустой сегмент (тишина): окно без слов claude не беспокоит и откатом
+        # Пустой сегмент (тишина): окно без слов ollama не беспокоит и откатом
         # не считается — терять в нём нечего.
         quiet = _fixture_transcript(segments=3, without_words=())
         quiet["segments"][1]["text"] = ""
@@ -1734,7 +1745,7 @@ def _test_reread_and_contract() -> None:
         path = _write_json(root / "transcript.json", transcript)
         out = str(root / "punctuated.json")
 
-        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None):
+        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None):
             code, _, _ = _run(["--transcript", path, "--out", out, "--window", "2"])
         _check(code == 1, "прогон вернул код %d, ожидался 1" % code)
 
@@ -1748,11 +1759,11 @@ def _test_reread_and_contract() -> None:
         _validate_payload(payload, transcript, path)
 
         # Повторный прогон того же транскрипта даёт такой же валидный файл.
-        # Пишется он рядом, а не поверх: подставной claude отвечает по списку
+        # Пишется он рядом, а не поверх: подставной ollama отвечает по списку
         # режимов, и второй прогон — это уже другое содержимое, по которому ниже
         # нельзя было бы проверять контракт со смесью «ок» и «откат».
         again = str(root / "punctuated-повтор.json")
-        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), CLAUDE_BIN=None):
+        with _env(PATH="%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"]), OLLAMA_BIN=None):
             code, _, _ = _run(["--transcript", path, "--out", again, "--window", "2"])
         _check(code in (0, 1), "повторный прогон вернул код %d" % code)
         _validate_payload(_read_json(again), transcript, path)
@@ -1864,8 +1875,8 @@ def selftest() -> int:
         ("удачный прогон: окна, абзацы, предложения, таймкоды", _test_successful_run),
         ("окно с изменённым словом откатывается", _test_changed_word),
         ("выдуманные, пропавшие слова и приписка откатывают окно", _test_invented_words),
-        ("claude не ответил по окну: откат, а не падение", _test_claude_failure),
-        ("claude недоступен: все окна в откате, код 1", _test_no_claude),
+        ("ollama не ответил по окну: откат, а не падение", _test_ollama_failure),
+        ("ollama недоступен: все окна в откате, код 1", _test_no_ollama),
         ("разбиение на предложения и абзацы", _test_sentence_splitting),
         ("нормализация слов и поиск расхождения", _test_word_check),
         ("края нарезки на окна и пустые сегменты", _test_window_edges),
@@ -1923,6 +1934,7 @@ def main(argv: list[str]) -> int:
             timeout=opts["timeout"],
             attempts=opts["attempts"],
             log_dir=opts["log_dir"],
+            model=opts["ollama_model"],
         )
     except KeyboardInterrupt:
         return die("прервано пользователем: файл не записан", code=1)

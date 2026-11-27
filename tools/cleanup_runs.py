@@ -4,7 +4,7 @@
 Прогон scripts/transcribe_lecture.sh оставляет рядом с итоговым документом
 рабочий подкаталог, в котором лежит всё, что понадобилось по пути: audio.wav
 (часто гигабайты), chunks/ с сотнями кусков, plan.json, transcript.txt,
-transcript.srt, checks.json, checks.txt, claude/ с промптами и ответами,
+transcript.srt, checks.json, checks.txt, ollama/ с промптами и ответами,
 run.log. Из этого стоит хранить ровно шесть файлов:
 
   transcript.json   дословное распознавание с таймкодами — его не воспроизвести
@@ -12,10 +12,10 @@ run.log. Из этого стоит хранить ровно шесть фай�
   diarization.json  интервалы говорящих — pyannote на CPU считает примерно в
                     реальном времени, на лекции это десятки минут;
   punctuated.json   распознанное с пунктуацией и предложениями — цена
-                    восстановления это десятки вызовов claude;
-  summary.md        фрагмент саммари — один вызов claude, но по живой записи;
+                    восстановления это десятки вызовов ollama;
+  summary.md        фрагмент саммари — один вызов ollama, но по живой записи;
   roles.json        роли говорящих («Преподаватель», «Студент N») — ещё один
-                    вызов claude;
+                    вызов ollama;
   speakers.json     расшифровка, разбитая на фразы с говорящими — считается
                     локально за секунды, но только из первых трёх файлов.
 
@@ -71,7 +71,7 @@ PROG = "cleanup_runs.py"
 # Файлы-хранители: остаются в каталоге, всё прочее удаляется. Порядок задаёт
 # порядок в отчёте — от самого дорогого к самому дешёвому по стоимости
 # повторного получения: часы работы модели, десятки минут pyannote на CPU,
-# десятки вызовов claude, один вызов claude, один вызов claude, секунды локально.
+# десятки вызовов ollama, один вызов ollama, один вызов ollama, секунды локально.
 KEEP_NAMES = (
     "transcript.json",
     "diarization.json",
@@ -104,7 +104,7 @@ HELP = f"""Использование:
 {KEEP_NAMES_HELP}
 
 а всё остальное удаляется — audio.wav, plan.json, chunks/, transcript.txt,
-transcript.srt, checks.json, checks.txt, claude/, run.log и любые другие файлы и
+transcript.srt, checks.json, checks.txt, ollama/, run.log и любые другие файлы и
 подкаталоги (вложенные — рекурсивно). Каталог, в котором не осталось ни одного
 из этих шести файлов, удаляется целиком вместе с содержимым.
 
@@ -679,8 +679,8 @@ def _make_run(
     _write(os.path.join(workdir, "run.log"), "лог прогона\n")
     for number in range(3):
         _write(os.path.join(workdir, "chunks", "chunk_%03d.wav" % number), "wav%d" % number)
-    _write(os.path.join(workdir, "claude", "punctuate-1.prompt.txt"), "промпт\n")
-    _write(os.path.join(workdir, "claude", "punctuate-1.response.txt"), "ответ\n")
+    _write(os.path.join(workdir, "ollama", "punctuate-1.prompt.txt"), "промпт\n")
+    _write(os.path.join(workdir, "ollama", "punctuate-1.response.txt"), "ответ\n")
 
     if audio_link is None:
         _write(os.path.join(workdir, "audio.wav"), "RIFF" + "0" * 64)
@@ -859,7 +859,7 @@ def _test_report() -> None:
             "удалено:",
             "оставлено: %s" % ", ".join(KEEP_NAMES),
             "chunks/ — 3 файла,",
-            "claude/ — 2 файла,",
+            "ollama/ — 2 файла,",
             "audio.wav —",
             "run.log —",
             "файлов-хранителей нет: каталог удалён целиком",
@@ -949,7 +949,7 @@ def _test_dry_run() -> None:
         # Полный список удаляемого: каждая верхнеуровневая запись названа.
         for name in (
             "audio.wav", "plan.json", "transcript.txt", "transcript.srt",
-            "checks.json", "checks.txt", "run.log", "chunks/", "claude/",
+            "checks.json", "checks.txt", "run.log", "chunks/", "ollama/",
         ):
             _check(name in report, "в списке --dry-run нет %r" % name)
         for needle in (

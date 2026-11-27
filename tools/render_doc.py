@@ -36,7 +36,7 @@ tools/outputs.py: там формат SRT (HH:MM:SS,mmm с округление�
 отделена от своего абзаца пустой строкой: без неё markdown по правилу ленивого
 продолжения затянул бы первую строку абзаца внутрь цитаты «>».
 
-Зависимостей нет: только стандартная библиотека. Ни claude, ни torch, ни ffmpeg
+Зависимостей нет: только стандартная библиотека. Ни ollama, ни torch, ни ffmpeg
 здесь не нужны — инструмент только собирает текст из готовых файлов. Проверки
 живут в самом файле (--selftest): в окружении проекта нет pytest.
 
@@ -784,7 +784,7 @@ def parse_roles(data: object, path: str = "<память>") -> dict[str, str]:
 
     Статус файла (ok, fallback, skip) здесь не проверяется: при fallback роли
     равны именам, при skip список пуст, и в обоих случаях ярлыки получаются
-    правильные сами собой. Решение «звать ли claude ещё раз» принимает не этот
+    правильные сами собой. Решение «звать ли ollama ещё раз» принимает не этот
     инструмент.
     """
     data = _check_foreign_schema(data, ROLES_SCHEMA)
@@ -869,7 +869,7 @@ def read_summary(path: str | None) -> tuple[str, str | None]:
             raw = handle.read()
     except FileNotFoundError:
         # Про отсутствующий файл в stderr не пишем: это ожидаемый исход прогона,
-        # в котором claude не ответил, и он уже виден по пометке и коду 1.
+        # в котором ollama не ответил, и он уже виден по пометке и коду 1.
         return "", None
     except IsADirectoryError:
         return "", "вместо файла саммари указан каталог: %s" % path
@@ -1020,8 +1020,12 @@ def build_phrase_blocks(
 
     Фразы обязаны идти по порядку, не перекрываться и покрывать все предложения
     punctuated/1: иначе часть расшифровки просто исчезла бы из документа, а это
-    хуже, чем документ без ярлыков. Границы абзацев берутся из поля paragraph
-    фраз, окно пунктуации — у предложений, которые фраза собой закрывает.
+    хуже, чем документ без ярлыков. Одно общее предложение у соседних фраз —
+    не перекрытие: speakers.py режет фразу по слову, и смена говорящего или
+    пауза внутри предложения дают ровно такой стык, а текст строки берётся из
+    фразы, поэтому ничего не дублируется. Границы абзацев берутся из поля
+    paragraph фраз, окно пунктуации — у предложений, которые фраза собой
+    закрывает.
     """
     by_index = {sentence.index: sentence for sentence in data.sentences}
     covered: set[int] = set()
@@ -1031,7 +1035,7 @@ def build_phrase_blocks(
     blocks: list[Block] = []
     current_key: object = object()  # заведомо не равно ни одному номеру абзаца
     for phrase in speakers.phrases:
-        if previous_last is not None and phrase.first_sentence <= previous_last:
+        if previous_last is not None and phrase.first_sentence < previous_last:
             raise SpeakersError(
                 "фраза index=%d: предложения %d–%d перекрывают предыдущую фразу "
                 "или идут не по порядку"
@@ -1432,7 +1436,7 @@ def _fixture_summary() -> str:
 
 
 def _fixture_punctuated(*, fallback: bool = False) -> dict:
-    """Файл схемы punctuated/1 для проверок: собирается в памяти, без claude.
+    """Файл схемы punctuated/1 для проверок: собирается в памяти, без ollama.
 
     Два окна и три абзаца. Второе окно начинается на 3723-й секунде — это ровно
     01:02:03, то есть случай «таймкод больше часа» из критериев приёмки. При
@@ -1554,10 +1558,10 @@ def _fixture_roles() -> dict:
         "status": "ok",
         "reason": "",
         "roles": [
-            {"speaker": "Говорящий 1", "role": "Преподаватель", "share": 0.7, "source": "claude"},
-            {"speaker": "Говорящий 2", "role": "Студент 1", "share": 0.3, "source": "claude"},
+            {"speaker": "Говорящий 1", "role": "Преподаватель", "share": 0.7, "source": "ollama"},
+            {"speaker": "Говорящий 2", "role": "Студент 1", "share": 0.3, "source": "ollama"},
         ],
-        "stats": {"speakers": 2, "from_claude": 2, "defaulted": 0},
+        "stats": {"speakers": 2, "from_ollama": 2, "defaulted": 0},
     }
 
 
@@ -2009,7 +2013,7 @@ def _test_degraded_input() -> None:
         # номер окна проставлен другой, и пометку обязан дать абзац.
         payload = _fixture_punctuated()
         payload["windows"][0]["status"] = "fallback"
-        payload["windows"][0]["reason"] = "claude недоступен"
+        payload["windows"][0]["reason"] = "ollama недоступен"
         for item in payload["sentences"][:4]:
             item["window"] = 1
         path = _write_json(os.path.join(workdir, "window0.json"), payload)
@@ -2129,6 +2133,32 @@ def _test_speaker_labels() -> None:
         _check(
             got == ["Говорящий 1", "Говорящий 2", None, "Говорящий 1", "Говорящий 2"],
             "без --roles ярлыки не стали именами говорящих: %r" % got,
+        )
+
+        # Смена говорящего посреди предложения 2: у двух соседних фраз одно общее
+        # предложение. Так speakers.py режет по слову, и это не перекрытие —
+        # ярлыки проставлены, текст не потерян и не задвоен.
+        split = _fixture_speakers()
+        whole = split["phrases"][1]
+        head = dict(whole, text="Первый вопрос —", end=12.0)
+        tail = dict(whole, text="заголовок документа.", speaker="Говорящий 1", start=12.0)
+        split["phrases"][1:2] = [head, tail]
+        for number, phrase in enumerate(split["phrases"]):
+            phrase["index"] = number
+        split_path = _write_json(os.path.join(workdir, "разрез.json"), split)
+        out_split = os.path.join(workdir, "разрез.md")
+        code, _, stderr = _run(
+            ["--punctuated", punctuated, "--summary", summary,
+             "--speakers", split_path, "--roles", roles, "--out", out_split]
+        )
+        _check(code == 0, "разрез внутри предложения вернул код %d (stderr: %s)" % (code, stderr.strip()))
+        with open(out_split, "r", encoding="utf-8") as handle:
+            doc_split = parse_document(handle.read())
+        _check(not doc_split.notes, "разрез внутри предложения дал пометку: %r" % doc_split.notes)
+        _check(
+            _speaker_lines(doc_split)[1:3]
+            == [(9, "Студент 1: Первый вопрос —"), (12, "Преподаватель: заголовок документа.")],
+            "разрез внутри предложения собрался не так: %r" % _speaker_lines(doc_split)[1:3],
         )
 
         # Окно в откате: пометка та же и про тот же диапазон сегментов.
@@ -2257,7 +2287,7 @@ def _test_speakers_degraded() -> None:
             os.path.join(workdir, "чужие роли.json"),
             dict(
                 _fixture_roles(),
-                roles=[{"speaker": "Спикер A", "role": "Преподаватель", "share": 1.0, "source": "claude"}],
+                roles=[{"speaker": "Спикер A", "role": "Преподаватель", "share": 1.0, "source": "ollama"}],
             ),
         )
         out = os.path.join(workdir, "чужие роли.md")
@@ -2317,13 +2347,13 @@ def _test_speakers_note() -> None:
         out2 = os.path.join(workdir, "с точкой.md")
         code, _, _ = _run(
             ["--punctuated", punctuated, "--summary", summary, "--out", out2,
-             "--speakers-note", "claude недоступен."]
+             "--speakers-note", "ollama недоступен."]
         )
         _check(code == 1, "вторая пометка вернула код %d" % code)
         with open(out2, "r", encoding="utf-8") as handle:
             doc2 = parse_document(handle.read())
         _check(
-            doc2.notes[0].endswith("claude недоступен."),
+            doc2.notes[0].endswith("ollama недоступен."),
             "в пометке две точки подряд: %r" % doc2.notes[0],
         )
 

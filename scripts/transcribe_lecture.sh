@@ -25,25 +25,26 @@
 #     означает потерянные слова, а замер по эталону показал, что в этом режиме
 #     WER ниже;
 #   * диаризация (кто и когда говорил) идёт после удачного распознавания, а не
-#     до него: на CPU pyannote считает примерно в реальном времени, и тратить
-#     эти десятки минут на прогон, у которого транскрипта так и не вышло, было
+#     до него: это самый долгий шаг после распознавания (на видеоядре Mac
+#     лекция 02:35:29 — около 15 минут, на CPU — примерно в реальном времени),
+#     и тратить это время на прогон, у которого транскрипта так и не вышло, было
 #     бы бессмысленно. Веса pyannote не скачиваются — нужен заранее
 #     подготовленный локальный кэш, см. tools/diarize.py;
-#   * пунктуацию ставит claude окнами по --window сегментов, и после каждого
+#   * пунктуацию ставит Ollama окнами по --window сегментов, и после каждого
 #     окна tools/punctuate.py сверяет последовательность слов с выходом модели:
-#     claude расставляет знаки, заглавные и абзацы, но менять слова ему запрещено.
+#     Ollama расставляет знаки, заглавные и абзацы, но менять слова ему запрещено.
 #     Окно, не прошедшее сверку, откатывается к дословному тексту и помечается
 #     в документе — лучше видимая пометка, чем незаметно переписанная лекция;
 #   * фразы с говорящими и роли считаются по готовой пунктуации: границы фраз
 #     берут абзацы из punctuated.json, а роли («Преподаватель», «Студент N»)
-#     определяет claude по тексту уже разбитой на фразы расшифровки;
-#   * саммари делается одним отдельным вызовом по всему тексту: окна для него не
-#     годятся, изложение и темы нужны по записи целиком, зато ярлыки говорящих к
-#     этому моменту уже есть — и в саммари видно, кто что сказал.
+#     определяет Ollama по тексту уже разбитой на фразы расшифровки;
+#   * саммари делается локальной Ollama частями по таймкодам; списки частей
+#     объединяются без повторного пересказа, а изложение сводится отдельно.
+#     Ярлыки говорящих к этому моменту уже есть.
 #
 # Веса не скачиваются: чекпойнт должен уже лежать в --download-root. Отсутствие
-# claude прогон не останавливает — расшифровка в этом случае всё равно будет
-# собрана, но с пометками «не получено» и ненулевым кодом возврата. Так же
+# Ollama прогон не останавливает — расшифровка в этом случае всё равно
+# будет собрана с видимыми пометками и ненулевым кодом возврата. Так же
 # устроены и шаги говорящих: не получилась диаризация, не удалась привязка фраз
 # или не вышли роли — документ собирается без ярлыков, в нём встаёт видимая
 # пометка с причиной, код возврата 1. Совсем отказаться от этих шагов можно
@@ -56,7 +57,8 @@
 # промежуточные файлы нетронутыми: по ним потом и разбираются.
 #
 # Зависимости: ffmpeg, ffprobe, shasum, awk, python с gigaam (берётся из
-# ./.venv/bin/python, иначе python3) и claude в PATH. Сеть нужна только claude.
+# ./.venv/bin/python, иначе python3), локальная Ollama.
+# Ollama вызывается через loopback.
 # Всё, что скрипт пишет, лежит под --outdir внутри data/, закрытого корневым
 # .gitignore: текст лекции в репозиторий не попадает.
 #
@@ -83,10 +85,12 @@ source scripts/lib/common.sh
 INPUT=""
 OUTDIR="data/output"
 MODEL="v3_rnnt"
+OLLAMA_MODEL="qwen3:8b"
 DEVICE="cpu"
+DIARIZE_DEVICE="auto"
 DOWNLOAD_ROOT="$HOME/.cache/gigaam"
 FROM_TRANSCRIPT=""
-WINDOW="100"
+WINDOW="25"
 KEEP_CHUNKS=1
 CLEAN=0
 DIARIZE=1
@@ -103,8 +107,9 @@ usage() {
 
 Расшифровка записи целиком одной командой: любой читаемый ffmpeg медиафайл
 (webm, mp4, mp3, m4a, wav) приводится к 16 кГц моно WAV, режется по тишине без
-выбрасывания пауз, распознаётся GigaAM, пунктуацию расставляет claude без
-изменения слов, pyannote определяет, кто и когда говорил, после чего собирается
+выбрасывания пауз, распознаётся GigaAM, пунктуацию расставляет Ollama без
+изменения слов, pyannote определяет, кто и когда говорил, Ollama делает саммари,
+после чего собирается
 один markdown: саммари и расшифровка фразами с ярлыком говорящего.
 
 Опции:
@@ -113,7 +118,14 @@ usage() {
   --outdir <каталог>      куда писать итог и рабочий подкаталог
                           (по умолчанию data/output)
   --model <имя>           чекпойнт GigaAM (по умолчанию v3_rnnt)
-  --device <устройство>   устройство для torch (по умолчанию cpu)
+  --ollama-model <имя>   модель Ollama для пунктуации, ролей и саммари
+                          (по умолчанию qwen3:8b)
+  --device <устройство>   устройство для torch у распознавания GigaAM
+                          (по умолчанию cpu)
+  --diarize-device <у.>   устройство для pyannote: auto, cpu, mps, cuda; auto
+                          берёт видеоядро Mac (mps), если оно есть, иначе cpu
+                          (по умолчанию auto). На mps лекция 02:35:29 — ~15 мин,
+                          на cpu — примерно в реальном времени
   --download-root <кат.>  каталог с весами GigaAM (по умолчанию ~/.cache/gigaam)
   --from-transcript <п.>  взять готовый transcript.json и переделать только
                           пунктуацию, саммари и итоговый документ: конвертация,
@@ -121,8 +133,8 @@ usage() {
                           таймкодов пропускаются. Шаги говорящих без
                           --diarization пропускаются тоже (звука под рукой уже
                           нет), и это не пометка — код возврата не меняется
-  --window <число>        сколько сегментов отправлять claude в одном окне
-                          пунктуации (по умолчанию 100)
+  --window <число>        сколько сегментов отправлять Ollama в одном окне
+                          пунктуации (по умолчанию 25)
   --no-diarize            не определять говорящих: шаги диаризации, фраз и
                           ролей пропускаются целиком, расшифровка идёт
                           предложениями без ярлыков. Это не пометка: безупречный
@@ -136,7 +148,7 @@ usage() {
   --clean                 после сборки документа вычистить рабочий подкаталог
                           вызовом tools/cleanup_runs.py --run <подкаталог>:
                           удаляются audio.wav, plan.json, chunks/, .txt и .srt,
-                          проверки таймкодов, claude/ и run.log, а результаты
+                          проверки таймкодов, ollama/ и run.log, а результаты
                           шагов остаются. Что именно считать лишним, решает тот
                           инструмент — список файлов-хранителей живёт там, см.
                           python tools/cleanup_runs.py --help. Чистка идёт
@@ -168,7 +180,7 @@ usage() {
       speakers.json                 фразы с говорящими
       roles.json                    роли говорящих: «Преподаватель», «Студент N»
       summary.md                    фрагмент саммари
-      claude/                       промпты и ответы claude по вызовам
+            ollama/                       промпты и ответы локальной модели
       run.log                       весь вывод этого прогона
 
 При --clean и безупречном прогоне от этого подкаталога остаются только
@@ -180,9 +192,9 @@ usage() {
 tools/outputs.py -> tools/check_timecodes.py -> tools/diarize.py ->
 tools/punctuate.py -> tools/speakers.py -> tools/roles.py ->
 tools/summarize.py -> tools/render_doc.py, при --clean в конце ещё
-tools/cleanup_runs.py. Диаризация стоит после распознавания: на CPU pyannote
-считает примерно в реальном времени, и на прогон без транскрипта эти десятки
-минут тратить незачем. Каждая команда печатается перед запуском. Последняя
+tools/cleanup_runs.py. Диаризация стоит после распознавания: это самый долгий
+шаг (на видеоядре Mac лекция 02:35:29 — около 15 минут, на CPU — примерно в
+реальном времени), и на прогон без транскрипта это время тратить незачем. Каждая команда печатается перед запуском. Последняя
 строка вывода — полный путь к итоговому .md.
 
 Коды возврата:
@@ -220,7 +232,9 @@ while [ $# -gt 0 ]; do
     --input)           [ $# -ge 2 ] || die "--input требует путь";            INPUT="$2";           shift 2 ;;
     --outdir)          [ $# -ge 2 ] || die "--outdir требует каталог";        OUTDIR="$2";          shift 2 ;;
     --model)           [ $# -ge 2 ] || die "--model требует имя чекпойнта";   MODEL="$2";           shift 2 ;;
+    --ollama-model)    [ $# -ge 2 ] || die "--ollama-model требует имя модели"; OLLAMA_MODEL="$2"; shift 2 ;;
     --device)          [ $# -ge 2 ] || die "--device требует значение";       DEVICE="$2";          shift 2 ;;
+    --diarize-device)  [ $# -ge 2 ] || die "--diarize-device требует значение"; DIARIZE_DEVICE="$2"; shift 2 ;;
     --download-root)   [ $# -ge 2 ] || die "--download-root требует каталог"; DOWNLOAD_ROOT="$2";   shift 2 ;;
     --from-transcript) [ $# -ge 2 ] || die "--from-transcript требует путь к transcript.json"
                        FROM_TRANSCRIPT="$2"; shift 2 ;;
@@ -242,6 +256,7 @@ done
 
 [ -n "$OUTDIR" ] || die "--outdir пуст: некуда писать результат"
 [ -n "$MODEL" ]  || die "--model пуст: не задан чекпойнт"
+[ -n "$OLLAMA_MODEL" ] || die "--ollama-model пуст: не задана модель Ollama"
 
 if [ -n "$FROM_TRANSCRIPT" ]; then
   [ -f "$FROM_TRANSCRIPT" ] || die "не найден файл транскрипта: $FROM_TRANSCRIPT"
@@ -285,7 +300,7 @@ fi
 
 # --------------------------------------------------- проверка окружения ---
 
-REQUIRED_TOOLS=(chunker transcribe outputs check_timecodes punctuate summarize render_doc)
+REQUIRED_TOOLS=(chunker transcribe outputs check_timecodes punctuate summarize render_doc ollama_client)
 # cleanup_runs.py спрашивается только при --clean: без флага чистки не будет, и
 # обрывать из-за него прогон, которому этот файл не понадобится, незачем. Зато с
 # флагом отсутствие инструмента должно вылезти здесь, до получаса распознавания,
@@ -318,25 +333,28 @@ else
   WEIGHTS_NOTE="$DOWNLOAD_ROOT/$MODEL.ckpt"
 fi
 
-# Отсутствие claude — не ошибка прогона: расшифровка нужна человеку и без
-# пунктуации. Предупреждение печатается до начала работы, чтобы не ждать
-# полчаса распознавания ради пометок «не получено».
-CLAUDE_NOTE="есть"
-if ! "$PY" tools/claude_cli.py --probe >/dev/null 2>&1; then
-  warn "claude в PATH не найден: расшифровка будет собрана, но без пунктуации, саммари и ролей говорящих (ярлыками станут «Говорящий N»), код возврата 1"
-  CLAUDE_NOTE="НЕТ — пунктуации, саммари и ролей не будет"
+# Недоступная локальная модель оставляет исходный текст с видимыми пометками.
+OLLAMA_NOTE="Ollama, $OLLAMA_MODEL"
+if ! "$PY" tools/ollama_client.py --probe --model "$OLLAMA_MODEL" >/dev/null 2>&1; then
+  warn "Ollama или модель $OLLAMA_MODEL недоступна: пунктуация, роли и саммари будут с пометками"
+  OLLAMA_NOTE="$OLLAMA_NOTE — недоступна"
 fi
 
 # Диаризация — самый долгий шаг конвейера после распознавания, и человек должен
 # узнать об этом до того, как уйдёт пить чай на полчаса, а не после. Говорится
 # и про кэш: веса pyannote не скачиваются ни при каком раскладе.
-DIARIZE_NOTE="pyannote, устройство $DEVICE"
+DIARIZE_NOTE="pyannote, устройство $DIARIZE_DEVICE"
 if [ "$SPEAKER_STEPS" -eq 0 ]; then
   DIARIZE_NOTE="выключена — $SKIP_REASON"
 elif [ -n "$DIARIZATION_IN" ]; then
   DIARIZE_NOTE="готовый файл: $DIARIZATION_IN (pyannote не запускается)"
 else
-  warn "диаризация на CPU считает примерно в реальном времени: на записи 02:35:29 это десятки минут. Нужен заранее подготовленный локальный кэш pyannote — весов инструмент не скачивает; без кэша шаг вернёт код 2, документ соберётся без ярлыков говорящих, код возврата 1. Не нужны говорящие — --no-diarize; есть готовый файл — --diarization <путь>"
+  if [ "$DIARIZE_DEVICE" = "cpu" ]; then
+    DIARIZE_TIME="диаризация на CPU считает примерно в реальном времени: запись 02:35:29 займёт часы — на Mac с видеоядром быстрее --diarize-device auto (около 15 минут)"
+  else
+    DIARIZE_TIME="диаризация — самый долгий шаг после распознавания: на видеоядре Mac запись 02:35:29 считается около 15 минут, без видеоядра (auto выберет cpu) — примерно в реальном времени"
+  fi
+  warn "$DIARIZE_TIME. Нужен заранее подготовленный локальный кэш pyannote — весов инструмент не скачивает; без кэша шаг вернёт код 2, документ соберётся без ярлыков говорящих, код возврата 1. Не нужны говорящие — --no-diarize; есть готовый файл — --diarization <путь>"
 fi
 
 # ------------------------------------------------------- имена и каталоги ---
@@ -417,7 +435,7 @@ PUNCTUATED="$WORKDIR/punctuated.json"
 SPEAKERS="$WORKDIR/speakers.json"
 ROLES="$WORKDIR/roles.json"
 SUMMARY="$WORKDIR/summary.md"
-CLAUDE_LOGS="$WORKDIR/claude"
+OLLAMA_LOGS="$WORKDIR/ollama"
 LOG="$WORKDIR/run.log"
 
 # Весь дальнейший вывод идёт и на экран, и в run.log: человек смотрит прогон
@@ -455,7 +473,7 @@ printf 'Итог:          %s\n' "$DOC"
 printf 'Рабочий кат.:  %s\n' "$WORKDIR"
 
 print_env_block "$DEVICE"
-printf '  claude:         %s\n' "$CLAUDE_NOTE"
+printf '  локальная модель: %s\n' "$OLLAMA_NOTE"
 printf '  веса:           %s\n' "$WEIGHTS_NOTE"
 printf '  диаризация:     %s\n' "$DIARIZE_NOTE"
 
@@ -635,9 +653,9 @@ elif [ -n "$DIARIZATION_IN" ]; then
 else
   printf '\n================ ДИАРИЗАЦИЯ ================\n'
   printf '$ %s tools/diarize.py --input %s --out %s --device %s\n' \
-    "$PY" "$WAV" "$DIARIZATION" "$DEVICE"
+    "$PY" "$WAV" "$DIARIZATION" "$DIARIZE_DEVICE"
   rc=0
-  "$PY" tools/diarize.py --input "$WAV" --out "$DIARIZATION" --device "$DEVICE" || rc=$?
+  "$PY" tools/diarize.py --input "$WAV" --out "$DIARIZATION" --device "$DIARIZE_DEVICE" || rc=$?
   if [ "$rc" -ge 2 ] || [ ! -s "$DIARIZATION" ]; then
     step "диаризация" "ПРОВАЛ — diarize.py вернул код $rc, файла нет"
     SPEAKERS_NOTE="диаризация не удалась: tools/diarize.py вернул код $rc"
@@ -658,16 +676,16 @@ fi
 
 if [ "$NO_DOC" -eq 0 ]; then
   printf '\n================ ПУНКТУАЦИЯ ================\n'
-  printf '$ %s tools/punctuate.py --transcript %s --out %s --window %s --log-dir %s\n' \
-    "$PY" "$TRANSCRIPT" "$PUNCTUATED" "$WINDOW" "$CLAUDE_LOGS"
+  printf '$ %s tools/punctuate.py --transcript %s --out %s --window %s --ollama-model %s --log-dir %s\n' \
+    "$PY" "$TRANSCRIPT" "$PUNCTUATED" "$WINDOW" "$OLLAMA_MODEL" "$OLLAMA_LOGS"
   rc=0
   "$PY" tools/punctuate.py --transcript "$TRANSCRIPT" --out "$PUNCTUATED" \
-    --window "$WINDOW" --log-dir "$CLAUDE_LOGS" || rc=$?
+    --window "$WINDOW" --ollama-model "$OLLAMA_MODEL" --log-dir "$OLLAMA_LOGS" || rc=$?
   if [ "$rc" -ge 2 ] || [ ! -s "$PUNCTUATED" ]; then
     step "пунктуация" "ПРОВАЛ — punctuate.py вернул код $rc, предложений нет"
     NO_DOC=1
   elif [ "$rc" -eq 1 ]; then
-    # Код 1 у punctuate.py — это окна, откатившиеся к дословному тексту: claude
+    # Код 1 у punctuate.py — это окна, откатившиеся к дословному тексту: Ollama
     # не ответил или изменил слова. Документ будет, но с пометками.
     step "пунктуация" "С ПОМЕТКАМИ — есть окна с дословным текстом (код $rc)"
     FLAWED=1
@@ -717,11 +735,11 @@ else
     fi
 
     printf '\n================ РОЛИ ГОВОРЯЩИХ ================\n'
-    printf '$ %s tools/roles.py --speakers %s --out %s --log-dir %s\n' \
-      "$PY" "$SPEAKERS" "$ROLES" "$CLAUDE_LOGS"
+    printf '$ %s tools/roles.py --speakers %s --out %s --ollama-model %s --log-dir %s\n' \
+      "$PY" "$SPEAKERS" "$ROLES" "$OLLAMA_MODEL" "$OLLAMA_LOGS"
     rc=0
     "$PY" tools/roles.py --speakers "$SPEAKERS" --out "$ROLES" \
-      --log-dir "$CLAUDE_LOGS" || rc=$?
+      --ollama-model "$OLLAMA_MODEL" --log-dir "$OLLAMA_LOGS" || rc=$?
     if [ "$rc" -ge 2 ] || [ ! -s "$ROLES" ]; then
       # Неудача любого из трёх шагов — это документ без ярлыков целиком:
       # --speakers без --roles дал бы расшифровку с «Говорящий N» вместо ролей,
@@ -761,7 +779,7 @@ if [ "$NO_DOC" -eq 0 ]; then
   if [ "$LABELS" -eq 1 ]; then
     SUMMARIZE_ARGS+=(--speakers "$SPEAKERS_ARG" --roles "$ROLES_ARG")
   fi
-  SUMMARIZE_ARGS+=(--out "$SUMMARY" --log-dir "$CLAUDE_LOGS")
+  SUMMARIZE_ARGS+=(--ollama-model "$OLLAMA_MODEL" --out "$SUMMARY" --log-dir "$OLLAMA_LOGS")
   printf '$ %s tools/summarize.py' "$PY"
   printf ' %s' "${SUMMARIZE_ARGS[@]}"
   printf '\n'
@@ -775,7 +793,7 @@ if [ "$NO_DOC" -eq 0 ]; then
   else
     SUMMARY_ARG="$SUMMARY"
     if [ "$rc" -eq 1 ]; then
-      step "саммари" "НЕ ПОЛУЧЕНО — claude не ответил, в документе пометка (код $rc)"
+      step "саммари" "НЕ ПОЛУЧЕНО — Ollama не ответила, в документе пометка (код $rc)"
       FLAWED=1
     else
       step "саммари" "ок — $SUMMARY"
@@ -848,8 +866,8 @@ done
 if [ -d "$WORKDIR/chunks" ]; then
   printf '  %s/chunks/\n' "$WORKDIR"
 fi
-if [ -d "$CLAUDE_LOGS" ]; then
-  printf '  %s/\n' "$CLAUDE_LOGS"
+if [ -d "$OLLAMA_LOGS" ]; then
+  printf '  %s/\n' "$OLLAMA_LOGS"
 fi
 printf '  %s\n' "$LOG_NOTE"
 

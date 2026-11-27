@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""roles.py — claude превращает «Говорящий N» в роли «Преподаватель» и «Студент N».
+"""roles.py — ollama превращает «Говорящий N» в роли «Преподаватель» и «Студент N».
 
 На вход — файл схемы speakers/1 (его пишет tools/speakers.py: фразы с именами
 говорящих от диаризации). Диаризация делит речь по голосам и больше ничего о
 людях не знает: имена у неё обезличенные — «Говорящий 1», «Говорящий 2». Кто из
 них ведёт занятие, а кто учится, видно только по смыслу разговора, и это
-определяет claude одним вызовом по показательным фразам каждого говорящего.
+определяет ollama одним вызовом по показательным фразам каждого говорящего.
 
 На выход — JSON схемы roles/1: соответствие «Говорящий N → роль», где роли
 называются «Преподаватель» (он один) и «Студент 1», «Студент 2», … Этот файл
 читают tools/render_doc.py и tools/summarize.py, чтобы поставить ярлык в строку
 расшифровки, поэтому состав полей здесь фиксирован и менять его нельзя.
 
-Главное свойство: файл пишется всегда. Если claude недоступен, не авторизован,
+Главное свойство: файл пишется всегда. Если ollama недоступен, не авторизован,
 не ответил или ответил негодно, в файле остаётся то же соответствие, но роли в
 нём равны именам говорящих, стоит status «fallback» с причиной, а код возврата
 становится 1. Расшифровка стоит двух часов распознавания, и терять ярлыки совсем
@@ -20,12 +20,12 @@
 «Преподаватель», но лучше, чем строка без ярлыка. Код 2 оставлен для непригодного
 входа: там --out не создаётся и существующий файл не перетирается.
 
-Два случая решаются без claude. Говорящий всего один — он и есть ведущий
-занятие, звать claude не за чем (status «ok», source «default», код 0).
+Два случая решаются без ollama. Говорящий всего один — он и есть ведущий
+занятие, звать ollama не за чем (status «ok», source «default», код 0).
 Говорящих нет вовсе — соответствие пустое, status «skip», код 0: диаризация не
 дала ничего, но это не ошибка этого инструмента.
 
-Почему ответ claude не принимается дословно. Он может назвать говорящего,
+Почему ответ ollama не принимается дословно. Он может назвать говорящего,
 которого в записи нет, пропустить говорящего, дописать пояснение в роль или
 назвать «Преподавателем» сразу двоих — а документ собирается по этому файлу, и
 две роли «Преподаватель» в нём означают, что ярлыки врут. Поэтому роль чистится
@@ -37,19 +37,18 @@
 Что выбрано здесь из оставленного на усмотрение. Показательные фразы — это 15
 самых длинных фраз говорящего (в них видно, объясняет человек или спрашивает),
 поданные в порядке времени; длинная фраза обрезается, чтобы промпт двухчасовой
-записи влезал в предел длины аргумента командной строки. Роли, которых нет в
+записи помещался в контекст модели. Роли, которых нет в
 промпте, не отбрасываются, а чистятся и записываются как есть: ярлык с чужим
 словом читателю понятен, а потерянный ярлык — нет.
 
-Зависимости: только стандартная библиотека. Сам claude запускается через
-tools/claude_cli.py — это единственное место в проекте, где собирается его
-командная строка; своего subprocess здесь нет. Формат таймкода повторяет
+Зависимости: только стандартная библиотека. Модель вызывается через tools/ollama_client.py по локальному HTTP;
+своего subprocess здесь нет. Формат таймкода повторяет
 tools/render_doc.py (импортировать его здесь нельзя — список зависимостей этого
-инструмента ограничен claude_cli), чтобы «[01:02:03]» в промпте и в документе
+инструмента ограничен ollama_client), чтобы «[01:02:03]» в промпте и в документе
 означало одно и то же.
 
 Проверки живут в самом файле (--selftest): в окружении проекта нет pytest.
-Установленный claude для них не нужен и намеренно не используется — все вызовы
+Установленный ollama для них не нужен и намеренно не используется — все вызовы
 идут на подставных sh-скриптах.
 
 Использование:
@@ -75,7 +74,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-import claude_cli  # noqa: E402 — импорт возможен только после правки sys.path выше
+import ollama_client  # noqa: E402 — импорт возможен только после правки sys.path выше
 
 PROG = "roles.py"
 
@@ -92,9 +91,9 @@ STATUS_OK = "ok"
 STATUS_FALLBACK = "fallback"
 STATUS_SKIP = "skip"
 
-# Откуда взялась роль: claude назвал её, инструмент поставил «Студент N» вместо
+# Откуда взялась роль: ollama назвал её, инструмент поставил «Студент N» вместо
 # неназванной или роли нет вовсе и вместо неё стоит имя говорящего.
-SOURCE_CLAUDE = "claude"
+SOURCE_OLLAMA = "ollama"
 SOURCE_DEFAULT = "default"
 SOURCE_FALLBACK = "fallback"
 
@@ -103,17 +102,16 @@ SOURCE_FALLBACK = "fallback"
 MAX_ROLE_CHARS = 40
 
 # Сколько показательных фраз на говорящего уходит в промпт и насколько длинной
-# может быть одна: промпт передаётся аргументом командной строки, и у него есть
-# предел (см. claude_cli.MAX_PROMPT_BYTES).
+# может быть одна: промпт должен помещаться в контекст модели.
 MAX_PHRASES = 15
 MAX_PHRASE_CHARS = 300
 
-# Префикс имён файлов лога вызова (tools/claude_cli.py кладёт <tag>-NNN.*.txt).
+# Префикс имён файлов лога вызова (tools/ollama_client.py кладёт <tag>-NNN.*.txt).
 LOG_TAG = "роли"
 
-# Причины, которые попадают в поле reason, когда claude не звали.
+# Причины, которые попадают в поле reason, когда ollama не звали.
 REASON_SINGLE = (
-    "говорящий один: он и ведёт занятие, роль «%s» присвоена без вызова claude" % TEACHER
+    "говорящий один: он и ведёт занятие, роль «%s» присвоена без вызова ollama" % TEACHER
 )
 REASON_NO_SPEAKERS = "в speakers/1 нет ни одного говорящего — соответствие пустое"
 
@@ -121,7 +119,7 @@ HELP = """Использование:
   python tools/roles.py --speakers <speakers.json> --out <roles.json> [опции]
   python tools/roles.py --selftest
 
-Определяет одним вызовом claude, кто из говорящих кто по смыслу разговора, и
+Определяет одним вызовом ollama, кто из говорящих кто по смыслу разговора, и
 пишет JSON схемы roles/1 — соответствие «Говорящий N → роль». Роли называются
 «{teacher}» (он один) и «Студент 1», «Студент 2», … с нумерацией по убыванию
 доли речи.
@@ -131,25 +129,26 @@ HELP = """Использование:
 «Говорящий N -> Роль», без пояснений. Ответ разбирается терпимо: лишние строки
 игнорируются, неизвестные имена говорящих дают предупреждение в stderr, роль
 приводится к одной строке не длиннее {chars} символов. Говорящий, которого
-claude не назвал, получает «Студент N»; если роль «{teacher}» досталась
+ollama не назвал, получает «Студент N»; если роль «{teacher}» досталась
 нескольким, она остаётся у того, кто больше говорил, а остальные становятся
 «Студент N».
 
-Говорящий всего один — роль «{teacher}» присваивается без вызова claude.
+Говорящий всего один — роль «{teacher}» присваивается без вызова ollama.
 Говорящих нет вовсе — файл пишется с пустым соответствием и статусом «{skip}».
 
-Сам claude запускается через tools/claude_cli.py как `claude -p <промпт>`;
-модель не задаётся, вызов ровно один на прогон.
+Модель вызывается через tools/ollama_client.py по локальному HTTP на 127.0.0.1:11434;
+модель выбирается через --ollama-model, вызов ровно один на прогон.
 
 Опции:
   --speakers <файл>    JSON схемы speakers/1 от tools/speakers.py (обязателен)
   --out <файл>         куда записать JSON схемы roles/1 (обязателен)
-  --timeout <сек>      сколько ждать вызов claude (по умолчанию {timeout:g})
+  --ollama-model <имя> локальная модель (по умолчанию qwen3:8b)
+  --timeout <сек>      сколько ждать вызов ollama (по умолчанию {timeout:g})
   --attempts <N>       сколько попыток вызова делать (по умолчанию {attempts};
                        повтор бывает только на таймауте и ненулевом коде)
-  --log-dir <каталог>  куда tools/claude_cli.py положит промпт и ответ
+  --log-dir <каталог>  куда tools/ollama_client.py положит промпт и ответ
                        ({tag}-NNN.prompt.txt и {tag}-NNN.response.txt)
-  --selftest           прогнать встроенные проверки и выйти (claude не нужен)
+  --selftest           прогнать встроенные проверки и выйти (ollama не нужен)
   -h, --help           показать эту справку
 
 Каталог для --out создаётся при необходимости, файл пишется в UTF-8 с
@@ -157,14 +156,14 @@ ensure_ascii=False и отступом 2.
 
 Коды возврата:
   0  роли получены (в том числе когда говорящий один или говорящих нет)
-  1  claude не ответил или ответ негоден — файл записан, но роли в нём равны
+  1  ollama не ответил или ответ негоден — файл записан, но роли в нём равны
      именам говорящих и стоит status «{fallback}» с причиной
   2  вход непригоден (нет файла, не та схема, негодный список говорящих) или
      ошибка в аргументах — файл --out не создаётся и не перетирается
 
 Примеры:
   python tools/roles.py --speakers data/output/лекция/speakers.json \\
-      --out data/output/лекция/roles.json --log-dir data/output/лекция/claude
+      --out data/output/лекция/roles.json --log-dir data/output/лекция/ollama
   python tools/roles.py --speakers data/output/лекция/speakers.json \\
       --out data/output/лекция/roles.json --timeout 600 --attempts 1
 """.format(
@@ -173,8 +172,8 @@ ensure_ascii=False и отступом 2.
     chars=MAX_ROLE_CHARS,
     skip=STATUS_SKIP,
     fallback=STATUS_FALLBACK,
-    timeout=claude_cli.DEFAULT_TIMEOUT,
-    attempts=claude_cli.DEFAULT_ATTEMPTS,
+    timeout=ollama_client.DEFAULT_TIMEOUT,
+    attempts=ollama_client.DEFAULT_ATTEMPTS,
     tag=LOG_TAG,
 )
 
@@ -208,7 +207,7 @@ def format_timecode(seconds: float) -> str:
 
     Тот же формат, что в итоговом документе (tools/render_doc.py): дробная часть
     отбрасывается, а не округляется, части всегда двузначные. Импортировать
-    функцию оттуда нельзя — зависимости этого инструмента ограничены claude_cli,
+    функцию оттуда нельзя — зависимости этого инструмента ограничены ollama_client,
     — поэтому она повторена здесь.
     """
     value = float(seconds)
@@ -237,7 +236,7 @@ class Phrase:
 class Speaker:
     """Говорящий из speakers/1 — всё, что о нём нужно знать для промпта.
 
-    name    — имя от диаризации, «Говорящий N»: им же claude отвечает;
+    name    — имя от диаризации, «Говорящий N»: им же ollama отвечает;
     share   — доля речи от всей речи записи, 0..1;
     phrases — сколько у него фраз всего (а не сколько ушло в промпт);
     examples — показательные фразы, уже отобранные и упорядоченные по времени.
@@ -354,7 +353,7 @@ def pick_examples(phrases: list[Phrase]) -> list[Phrase]:
     Почему самые длинные. По коротким фразам («да», «угу», «понятно») роль не
     определить — они одинаковы у всех. Объяснение, постановка задачи и вопрос
     по теме длиннее, и именно в них видно, кто ведёт занятие. Порядок остаётся
-    временной: claude читает их как куски разговора, а не как рейтинг.
+    временной: ollama читает их как куски разговора, а не как рейтинг.
     """
     chosen = sorted(phrases, key=lambda phrase: (-len(phrase.text), phrase.start))
     chosen = chosen[:MAX_PHRASES]
@@ -419,7 +418,7 @@ def parse_speakers(data: object, path: str) -> Record:
         name = " ".join(name.split())
         if name in names:
             # Два говорящих с одним именем делают соответствие бессмысленным:
-            # непонятно, кому из них достанется роль из ответа claude.
+            # непонятно, кому из них достанется роль из ответа ollama.
             raise InputError("имя говорящего встречается дважды: %s" % name)
         names.append(name)
 
@@ -537,17 +536,17 @@ def build_prompt(speakers: list[Speaker]) -> str:
 
 # ------------------------------------------------------------ разбор ответа ---
 
-# Стрелка между именем и ролью. Промпт требует «->», но claude пишет и «→», и
+# Стрелка между именем и ролью. Промпт требует «->», но ollama пишет и «→», и
 # «=>», и длинное тире со стрелкой: выбрасывать из-за этого всё соответствие
 # жалко, а спутать такую строку с прозой нельзя.
 ARROW_RE = re.compile(r"\s*(?:-+>|=+>|→|—>|–>)\s*")
 
-# Маркер списка и разметка вокруг строки: claude иногда отвечает списком или
+# Маркер списка и разметка вокруг строки: ollama иногда отвечает списком или
 # ставит имя в обратные кавычки, хотя промпт этого не просил.
 BULLET_RE = re.compile(r"^\s*(?:[-*•+]|\d{1,3}[.)])\s+")
 MARKUP_CHARS = "*_`«»\"'"
 
-# Роль «Студент N», как её пишет claude: по ней считаются занятые номера.
+# Роль «Студент N», как её пишет ollama: по ней считаются занятые номера.
 STUDENT_RE = re.compile(r"^студент\s*(\d{1,3})$")
 
 
@@ -558,7 +557,7 @@ def _key(text: str) -> str:
 
 
 def clean_role(text: str) -> str:
-    """Роль из ответа claude -> одна строка не длиннее MAX_ROLE_CHARS.
+    """Роль из ответа ollama -> одна строка не длиннее MAX_ROLE_CHARS.
 
     Переносы и лишние пробелы снимаются, разметка и знаки препинания по краям
     отбрасываются, длинная роль обрезается. Известные названия приводятся к
@@ -585,13 +584,13 @@ def clean_role(text: str) -> str:
 
 
 def parse_answer(answer: str, speakers: list[Speaker]) -> dict[str, str]:
-    """Ответ claude -> соответствие «имя говорящего → роль».
+    """Ответ ollama -> соответствие «имя говорящего → роль».
 
     Разбирается построчно и терпимо: строка без стрелки — это пояснение или
     вступление, которых промпт не просил, и она просто пропускается. Строка со
     стрелкой, слева от которой не имя из списка, — это уже рассогласование, о
     нём говорится в stderr. Повторную строку про того же говорящего побеждает
-    первая: выбирать между двумя ответами claude инструменту не из чего, а
+    первая: выбирать между двумя ответами ollama инструменту не из чего, а
     молча брать последнюю — значит зависеть от порядка строк.
     """
     known = {_key(speaker.name): speaker.name for speaker in speakers}
@@ -625,11 +624,11 @@ def parse_answer(answer: str, speakers: list[Speaker]) -> dict[str, str]:
 
     if unknown:
         warn(
-            "в ответе claude названы говорящие, которых нет в записи: %s"
+            "в ответе ollama названы говорящие, которых нет в записи: %s"
             % ", ".join(sorted(set(unknown)))
         )
     if empty:
-        warn("в ответе claude %d строк без роли справа от стрелки" % empty)
+        warn("в ответе ollama %d строк без роли справа от стрелки" % empty)
     return mapping
 
 
@@ -656,8 +655,8 @@ class Result:
     called: bool = False
 
     @property
-    def from_claude(self) -> int:
-        return sum(1 for item in self.assignments if item.source == SOURCE_CLAUDE)
+    def from_ollama(self) -> int:
+        return sum(1 for item in self.assignments if item.source == SOURCE_OLLAMA)
 
     @property
     def defaulted(self) -> int:
@@ -688,7 +687,7 @@ def resolve_teacher(speakers: list[Speaker], mapping: dict[str, str]) -> dict[st
 
     Говорящие приходят по убыванию доли речи, поэтому побеждает первый из них.
     Остальные теряют роль и получают «Студент N» дальше, вместе с теми, кого
-    claude не назвал вовсе.
+    ollama не назвал вовсе.
     """
     claimed = [
         speaker.name
@@ -698,7 +697,7 @@ def resolve_teacher(speakers: list[Speaker], mapping: dict[str, str]) -> dict[st
     if len(claimed) <= 1:
         return mapping
     warn(
-        "claude назвал «%s» нескольких (%s) — роль осталась у «%s», он говорил больше"
+        "ollama назвал «%s» нескольких (%s) — роль осталась у «%s», он говорил больше"
         % (TEACHER, ", ".join(claimed), claimed[0])
     )
     return {
@@ -709,10 +708,10 @@ def resolve_teacher(speakers: list[Speaker], mapping: dict[str, str]) -> dict[st
 
 
 def assign_roles(speakers: list[Speaker], mapping: dict[str, str]) -> Result:
-    """Собирает итоговое соответствие из ответа claude и умолчаний.
+    """Собирает итоговое соответствие из ответа ollama и умолчаний.
 
     Говорящий, роли которому не досталось, получает «Студент N» со свободным
-    номером: занятыми считаются номера студентов, которых назвал claude, —
+    номером: занятыми считаются номера студентов, которых назвал ollama, —
     иначе в документе оказалось бы два «Студента 1».
     """
     mapping = resolve_teacher(speakers, mapping)
@@ -729,7 +728,7 @@ def assign_roles(speakers: list[Speaker], mapping: dict[str, str]) -> Result:
     number = 0
     for speaker in speakers:
         role = mapping.get(speaker.name)
-        source = SOURCE_CLAUDE
+        source = SOURCE_OLLAMA
         if role is None:
             number += 1
             while number in taken:
@@ -750,25 +749,25 @@ def assign_roles(speakers: list[Speaker], mapping: dict[str, str]) -> Result:
         )
 
     if duplicates:
-        # Переименовывать за claude инструмент не станет: роль — это ярлык в
+        # Переименовывать за ollama инструмент не станет: роль — это ярлык в
         # документе, и подмена его молча хуже, чем видимое предупреждение.
         warn(
             "одна роль досталась нескольким говорящим: %s"
             % ", ".join("«%s»" % role for role in sorted(set(duplicates)))
         )
     if not any(_key(item.role) == _key(TEACHER) for item in assignments):
-        warn("claude не назвал «%s» никого — в документе не будет этого ярлыка" % TEACHER)
+        warn("ollama не назвал «%s» никого — в документе не будет этого ярлыка" % TEACHER)
 
     return Result(status=STATUS_OK, reason="", assignments=assignments, called=True)
 
 
 def decide(record: Record, opts: dict) -> Result:
-    """Главное решение: кто какую роль получает. Вызов claude — ровно один."""
+    """Главное решение: кто какую роль получает. Вызов ollama — ровно один."""
     speakers = record.speakers
     if not speakers:
         return Result(status=STATUS_SKIP, reason=REASON_NO_SPEAKERS, assignments=[])
     if len(speakers) == 1:
-        # Звать claude не за чем: выбирать не из кого, а единственный говорящий
+        # Звать ollama не за чем: выбирать не из кого, а единственный говорящий
         # на занятии — это тот, кто его ведёт.
         speaker = speakers[0]
         return Result(
@@ -786,23 +785,24 @@ def decide(record: Record, opts: dict) -> Result:
 
     prompt = build_prompt(speakers)
     try:
-        answer = claude_cli.ask(
+        answer = ollama_client.ask(
             prompt,
+            model=opts["ollama_model"],
             timeout=opts["timeout"],
             attempts=opts["attempts"],
             log_dir=opts["log_dir"],
             tag=LOG_TAG,
         )
-    except claude_cli.ClaudeUnavailable as exc:
-        return fallback_result(speakers, "вызывать claude нечем: %s" % exc, called=False)
-    except claude_cli.ClaudeFailed as exc:
-        return fallback_result(speakers, "claude не ответил: %s" % exc, called=True)
+    except ollama_client.OllamaUnavailable as exc:
+        return fallback_result(speakers, "вызывать ollama нечем: %s" % exc, called=False)
+    except ollama_client.OllamaFailed as exc:
+        return fallback_result(speakers, "ollama не ответил: %s" % exc, called=True)
 
     mapping = parse_answer(answer, speakers)
     if not mapping:
         return fallback_result(
             speakers,
-            "ответ claude негоден: в нём нет ни одной строки вида «Говорящий N -> Роль»",
+            "ответ ollama негоден: в нём нет ни одной строки вида «Говорящий N -> Роль»",
             called=True,
         )
     return assign_roles(speakers, mapping)
@@ -829,7 +829,7 @@ def build_document(record: Record, result: Result) -> dict:
         ],
         "stats": {
             "speakers": len(result.assignments),
-            "from_claude": result.from_claude,
+            "from_ollama": result.from_ollama,
             "defaulted": result.defaulted,
         },
     }
@@ -865,7 +865,7 @@ def print_report(path: str, size: int, record: Record, result: Result) -> None:
     sys.stdout.write(report_row("Вход", "%s (%s)" % (record.path, SPEAKERS_SCHEMA)))
     sys.stdout.write(report_row("Статус", result.status))
     sys.stdout.write(report_row("Говорящих", "%d" % len(result.assignments)))
-    sys.stdout.write(report_row("От claude", "%d" % result.from_claude))
+    sys.stdout.write(report_row("От ollama", "%d" % result.from_ollama))
     sys.stdout.write(report_row("По умолчанию", "%d" % result.defaulted))
     for item in result.assignments:
         sys.stdout.write(
@@ -884,6 +884,7 @@ _FLAGS_VALUE = {
     "--timeout": "timeout",
     "--attempts": "attempts",
     "--log-dir": "log_dir",
+    "--ollama-model": "ollama_model",
 }
 
 
@@ -896,9 +897,10 @@ def parse_args(argv: list[str]) -> dict:
     opts: dict = {
         "speakers": None,
         "out": None,
-        "timeout": claude_cli.DEFAULT_TIMEOUT,
-        "attempts": claude_cli.DEFAULT_ATTEMPTS,
+        "timeout": ollama_client.DEFAULT_TIMEOUT,
+        "attempts": ollama_client.DEFAULT_ATTEMPTS,
         "log_dir": None,
+        "ollama_model": ollama_client.DEFAULT_MODEL,
         "help": False,
         "selftest": False,
     }
@@ -1021,8 +1023,8 @@ def main(argv: list[str]) -> int:
 
 # ---------------------------------------------------------------- селф-тест ---
 #
-# Установленный claude здесь не нужен и намеренно не используется: все вызовы
-# идут на подставных sh-скриптах, путь к которым подсовывается через CLAUDE_BIN.
+# Установленный ollama здесь не нужен и намеренно не используется: все вызовы
+# идут на подставных sh-скриптах, путь к которым подсовывается через OLLAMA_BIN.
 # Каждая заглушка лежит в своём каталоге и пишет рядом с собой, сколько раз её
 # позвали и с какими аргументами, — так проверяется и число вызовов, и промпт.
 
@@ -1040,10 +1042,10 @@ def _check(condition: object, message: str) -> None:
 
 
 def _stub(root: str, name: str, body: str) -> str:
-    """Создаёт каталог с исполняемой заглушкой `claude` внутри."""
+    """Создаёт каталог с исполняемой заглушкой `ollama` внутри."""
     directory = os.path.join(root, name)
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, "claude")
+    path = os.path.join(directory, "ollama")
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(STUB_PREAMBLE + body)
     os.chmod(path, 0o755)
@@ -1076,10 +1078,10 @@ def _prompt_of(stub: str) -> str:
 
 
 def _run(argv: list[str], binary: str | None = None) -> tuple[int, str, str]:
-    """Сквозной прогон main() с перехватом вывода и подменой CLAUDE_BIN."""
-    saved = os.environ.get("CLAUDE_BIN")
+    """Сквозной прогон main() с перехватом вывода и подменой OLLAMA_BIN."""
+    saved = os.environ.get("OLLAMA_TEST_BIN")
     if binary is not None:
-        os.environ["CLAUDE_BIN"] = binary
+        os.environ["OLLAMA_TEST_BIN"] = binary
     stdout, stderr = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -1087,9 +1089,9 @@ def _run(argv: list[str], binary: str | None = None) -> tuple[int, str, str]:
     finally:
         if binary is not None:
             if saved is None:
-                os.environ.pop("CLAUDE_BIN", None)
+                os.environ.pop("OLLAMA_TEST_BIN", None)
             else:
-                os.environ["CLAUDE_BIN"] = saved
+                os.environ["OLLAMA_TEST_BIN"] = saved
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -1126,7 +1128,7 @@ def _fixture_phrases() -> list[tuple[str, float, str]]:
 
 
 def _fixture(names: int = 3) -> dict:
-    """Файл схемы speakers/1 для проверок: собирается в памяти, без claude."""
+    """Файл схемы speakers/1 для проверок: собирается в памяти, без ollama."""
     shares = {"Говорящий 1": 0.62, "Говорящий 2": 0.25, "Говорящий 3": 0.13}
     chosen = ["Говорящий %d" % (number + 1) for number in range(names)]
     phrases = [item for item in _fixture_phrases() if item[0] in chosen]
@@ -1165,7 +1167,7 @@ def _fixture(names: int = 3) -> dict:
 
 
 def _good_answer() -> str:
-    """Ответ claude, какого требует промпт: по строке на говорящего."""
+    """Ответ ollama, какого требует промпт: по строке на говорящего."""
     return (
         "Говорящий 1 -> Преподаватель\n"
         "Говорящий 2 -> Студент 1\n"
@@ -1181,7 +1183,7 @@ def _test_prompt() -> None:
         stub = _answering_stub(workdir, "ок", _good_answer())
         code, _, _ = _run(["--speakers", source, "--out", out], stub)
         _check(code == 0, "удачный прогон вернул код %d" % code)
-        _check(_calls(stub) == 1, "вызовов claude %d вместо одного" % _calls(stub))
+        _check(_calls(stub) == 1, "вызовов ollama %d вместо одного" % _calls(stub))
 
         prompt = _prompt_of(stub)
         _check("Говорящий N -> Роль" in prompt, "в промпте нет требуемого вида строк")
@@ -1243,15 +1245,15 @@ def _test_good_answer() -> None:
         _check(
             [(item["speaker"], item["role"], item["source"]) for item in data["roles"]]
             == [
-                ("Говорящий 1", TEACHER, SOURCE_CLAUDE),
-                ("Говорящий 2", "Студент 1", SOURCE_CLAUDE),
-                ("Говорящий 3", "Студент 2", SOURCE_CLAUDE),
+                ("Говорящий 1", TEACHER, SOURCE_OLLAMA),
+                ("Говорящий 2", "Студент 1", SOURCE_OLLAMA),
+                ("Говорящий 3", "Студент 2", SOURCE_OLLAMA),
             ],
             "не то соответствие: %r" % data["roles"],
         )
         _check(data["roles"][0]["share"] == 0.62, "доля речи потерялась: %r" % data["roles"][0])
         _check(
-            data["stats"] == {"speakers": 3, "from_claude": 3, "defaulted": 0},
+            data["stats"] == {"speakers": 3, "from_ollama": 3, "defaulted": 0},
             "не та статистика: %r" % data["stats"],
         )
         # Файл читаемый человеком: кириллица не экранирована, отступ два пробела.
@@ -1292,8 +1294,8 @@ def _test_untidy_answer() -> None:
         )
         _check("\n" not in long_role, "в роли остался перенос строки")
         _check(
-            _read_json(out)["stats"]["from_claude"] == 3,
-            "не все роли засчитаны как полученные от claude",
+            _read_json(out)["stats"]["from_ollama"] == 3,
+            "не все роли засчитаны как полученные от ollama",
         )
 
 
@@ -1312,7 +1314,7 @@ def _test_clean_role() -> None:
 
 
 def _test_defaulted() -> None:
-    """Говорящий, которого claude не назвал, получает «Студент N»."""
+    """Говорящий, которого ollama не назвал, получает «Студент N»."""
     with tempfile.TemporaryDirectory(prefix="roles-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "speakers.json"), _fixture())
         out = os.path.join(workdir, "roles.json")
@@ -1324,18 +1326,18 @@ def _test_defaulted() -> None:
         _check(
             [(item["role"], item["source"]) for item in data["roles"]]
             == [
-                (TEACHER, SOURCE_CLAUDE),
+                (TEACHER, SOURCE_OLLAMA),
                 ("Студент 1", SOURCE_DEFAULT),
                 ("Студент 2", SOURCE_DEFAULT),
             ],
             "не те умолчания: %r" % data["roles"],
         )
         _check(
-            data["stats"] == {"speakers": 3, "from_claude": 1, "defaulted": 2},
+            data["stats"] == {"speakers": 3, "from_ollama": 1, "defaulted": 2},
             "не та статистика: %r" % data["stats"],
         )
 
-        # Номер, который claude уже занял, умолчанию не достаётся.
+        # Номер, который ollama уже занял, умолчанию не достаётся.
         taken = _answering_stub(
             workdir, "занятый номер", "Говорящий 1 -> Преподаватель\nГоворящий 3 -> Студент 1\n"
         )
@@ -1343,7 +1345,7 @@ def _test_defaulted() -> None:
         _check(code == 0, "код %d вместо 0" % code)
         roles = {item["speaker"]: item["role"] for item in _read_json(out)["roles"]}
         _check(roles["Говорящий 2"] == "Студент 2", "номер студента занят дважды: %r" % roles)
-        _check(roles["Говорящий 3"] == "Студент 1", "роль от claude потеряна: %r" % roles)
+        _check(roles["Говорящий 3"] == "Студент 1", "роль от ollama потеряна: %r" % roles)
 
 
 def _test_two_teachers() -> None:
@@ -1365,7 +1367,7 @@ def _test_two_teachers() -> None:
         roles = {item["speaker"]: item["role"] for item in data["roles"]}
         _check(roles["Говорящий 1"] == TEACHER, "роль ушла не тому: %r" % roles)
         _check(roles["Говорящий 2"] == "Студент 2", "проигравший не стал студентом: %r" % roles)
-        _check(roles["Говорящий 3"] == "Студент 1", "роль от claude потеряна: %r" % roles)
+        _check(roles["Говорящий 3"] == "Студент 1", "роль от ollama потеряна: %r" % roles)
         _check(
             sum(1 for role in roles.values() if role == TEACHER) == 1,
             "«%s» в файле не один: %r" % (TEACHER, roles),
@@ -1373,12 +1375,12 @@ def _test_two_teachers() -> None:
         source_of = {item["speaker"]: item["source"] for item in data["roles"]}
         _check(
             source_of["Говорящий 2"] == SOURCE_DEFAULT,
-            "роль, отобранная у claude, осталась его: %r" % source_of,
+            "роль, отобранная у ollama, осталась его: %r" % source_of,
         )
 
 
 def _test_single_speaker() -> None:
-    """Говорящий один: «Преподаватель» без вызова claude, код 0."""
+    """Говорящий один: «Преподаватель» без вызова ollama, код 0."""
     with tempfile.TemporaryDirectory(prefix="roles-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "speakers.json"), _fixture(names=1))
         out = os.path.join(workdir, "roles.json")
@@ -1386,11 +1388,11 @@ def _test_single_speaker() -> None:
         stub = _stub(workdir, "не звать", "exit 5\n")
         code, report, _ = _run(["--speakers", source, "--out", out], stub)
         _check(code == 0, "код %d вместо 0" % code)
-        _check(_calls(stub) == 0, "claude позвали %d раз вместо нуля" % _calls(stub))
+        _check(_calls(stub) == 0, "ollama позвали %d раз вместо нуля" % _calls(stub))
 
         data = _read_json(out)
         _check(data["status"] == STATUS_OK, "статус %r вместо ok" % data["status"])
-        _check("без вызова claude" in data["reason"], "в причине не сказано, почему: %r" % data["reason"])
+        _check("без вызова ollama" in data["reason"], "в причине не сказано, почему: %r" % data["reason"])
         _check(
             data["roles"] == [
                 {"speaker": "Говорящий 1", "role": TEACHER, "share": 0.62, "source": SOURCE_DEFAULT}
@@ -1398,10 +1400,10 @@ def _test_single_speaker() -> None:
             "не та роль: %r" % data["roles"],
         )
         _check(
-            data["stats"] == {"speakers": 1, "from_claude": 0, "defaulted": 1},
+            data["stats"] == {"speakers": 1, "from_ollama": 0, "defaulted": 1},
             "не та статистика: %r" % data["stats"],
         )
-        _check("без вызова claude" in report, "в отчёте не сказано, почему claude не звали")
+        _check("без вызова ollama" in report, "в отчёте не сказано, почему ollama не звали")
 
 
 def _test_no_speakers() -> None:
@@ -1415,37 +1417,37 @@ def _test_no_speakers() -> None:
         stub = _stub(workdir, "не звать", "exit 5\n")
         code, report, _ = _run(["--speakers", source, "--out", out], stub)
         _check(code == 0, "код %d вместо 0" % code)
-        _check(_calls(stub) == 0, "claude позвали %d раз вместо нуля" % _calls(stub))
+        _check(_calls(stub) == 0, "ollama позвали %d раз вместо нуля" % _calls(stub))
 
         data = _read_json(out)
         _check(data["status"] == STATUS_SKIP, "статус %r вместо skip" % data["status"])
         _check(data["roles"] == [], "соответствие не пустое: %r" % data["roles"])
         _check(data["reason"], "у статуса skip нет причины")
         _check(
-            data["stats"] == {"speakers": 0, "from_claude": 0, "defaulted": 0},
+            data["stats"] == {"speakers": 0, "from_ollama": 0, "defaulted": 0},
             "не та статистика: %r" % data["stats"],
         )
         _check("РОЛИ" in report, "отчёт не напечатан")
 
 
 def _test_fallback() -> None:
-    """Claude не ответил или ответил негодно: роли = имена, статус fallback, код 1."""
+    """Ollama не ответил или ответил негодно: роли = имена, статус fallback, код 1."""
     with tempfile.TemporaryDirectory(prefix="roles-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "speakers.json"), _fixture())
         out = os.path.join(workdir, "roles.json")
 
         cases = (
-            ("упал", _stub(workdir, "упал", "exit 5\n"), "claude не ответил"),
-            ("пустой ответ", _stub(workdir, "пустой", "exit 0\n"), "claude не ответил"),
+            ("упал", _stub(workdir, "упал", "exit 5\n"), "ollama не ответил"),
+            ("пустой ответ", _stub(workdir, "пустой", "exit 0\n"), "ollama не ответил"),
             (
                 "ответ не по форме",
                 _answering_stub(workdir, "проза", "Я не могу определить роли по этой записи.\n"),
-                "ответ claude негоден",
+                "ответ ollama негоден",
             ),
             (
                 "нет бинарника",
-                os.path.join(workdir, "нет такого файла", "claude"),
-                "вызывать claude нечем",
+                os.path.join(workdir, "нет такого файла", "ollama"),
+                "вызывать ollama нечем",
             ),
         )
         for name, binary, needle in cases:
@@ -1465,7 +1467,7 @@ def _test_fallback() -> None:
                 "%s: не тот источник роли: %r" % (name, data["roles"]),
             )
             _check(
-                data["stats"] == {"speakers": 3, "from_claude": 0, "defaulted": 0},
+                data["stats"] == {"speakers": 3, "from_ollama": 0, "defaulted": 0},
                 "%s: не та статистика: %r" % (name, data["stats"]),
             )
             _check(data["reason"] in stderr, "%s: причина не продублирована в stderr" % name)
@@ -1533,7 +1535,7 @@ def _test_broken_input() -> None:
         code, _, _ = _run(["--speakers", broken, "--out", out], stub)
         _check(code == 2, "код %d вместо 2" % code)
         _check(not os.path.exists(out), "при коде 2 файл --out создан")
-        _check(_calls(stub) == 0, "при непригодном входе звали claude")
+        _check(_calls(stub) == 0, "при непригодном входе звали ollama")
 
 
 def _test_shares_and_order() -> None:
@@ -1567,11 +1569,11 @@ def _test_shares_and_order() -> None:
 
 
 def _test_log_dir() -> None:
-    """--log-dir: промпт и ответ claude остаются на диске."""
+    """--log-dir: промпт и ответ ollama остаются на диске."""
     with tempfile.TemporaryDirectory(prefix="roles-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "speakers.json"), _fixture())
         out = os.path.join(workdir, "roles.json")
-        log_dir = os.path.join(workdir, "claude")
+        log_dir = os.path.join(workdir, "ollama")
         stub = _answering_stub(workdir, "ок", _good_answer())
         code, _, _ = _run(["--speakers", source, "--out", out, "--log-dir", log_dir], stub)
         _check(code == 0, "код %d вместо 0" % code)
@@ -1583,7 +1585,7 @@ def _test_log_dir() -> None:
         prompt_log = _read(os.path.join(log_dir, "%s-001.prompt.txt" % LOG_TAG))
         _check("Говорящий 1: доля речи" in prompt_log, "в логе промпта нет говорящих")
         response_log = _read(os.path.join(log_dir, "%s-001.response.txt" % LOG_TAG))
-        _check(TEACHER in response_log, "в логе ответа нет ответа claude")
+        _check(TEACHER in response_log, "в логе ответа нет ответа ollama")
 
         # Неудачный вызов тоже оставляет оба файла — иначе непонятно, что ушло.
         broken = _stub(workdir, "упал2", "exit 5\n")
@@ -1622,7 +1624,7 @@ def _test_help() -> None:
 
 
 def _test_only_stdlib() -> None:
-    """Импорты — только стандартная библиотека и claude_cli."""
+    """Импорты — только стандартная библиотека и ollama_client."""
     allowed = {
         "__future__",
         "io",
@@ -1634,14 +1636,14 @@ def _test_only_stdlib() -> None:
         "tempfile",
         "contextlib",
         "dataclasses",
-        "claude_cli",
+        "ollama_client",
     }
     with open(os.path.abspath(__file__), "r", encoding="utf-8") as handle:
         source = handle.read()
     imported = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w]*)", source, re.MULTILINE))
     _check(imported, "импортов не нашлось — проверка сломана")
     _check(imported <= allowed, "лишние импорты: %r" % sorted(imported - allowed))
-    # Свой subprocess здесь не пишется: claude запускается только через обёртку.
+    # Свой subprocess здесь не пишется: ollama запускается только через обёртку.
     _check("subprocess" not in imported, "появился свой вызов subprocess")
 
 
@@ -1654,9 +1656,9 @@ def selftest() -> int:
         ("чистка роли до одной короткой строки", _test_clean_role),
         ("неназванный говорящий получает «Студент N»", _test_defaulted),
         ("несколько «%s»: роль у того, кто больше говорил" % TEACHER, _test_two_teachers),
-        ("один говорящий — без вызова claude", _test_single_speaker),
+        ("один говорящий — без вызова ollama", _test_single_speaker),
         ("говорящих нет — статус skip", _test_no_speakers),
-        ("claude не ответил или ответ негоден — откат и код 1", _test_fallback),
+        ("ollama не ответил или ответ негоден — откат и код 1", _test_fallback),
         ("непригодный вход и коды возврата", _test_broken_input),
         ("доли речи и порядок говорящих", _test_shares_and_order),
         ("--log-dir: промпт и ответ на диске", _test_log_dir),

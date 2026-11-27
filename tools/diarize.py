@@ -36,9 +36,13 @@ ffmpeg@8, и сам pyannote в своём предупреждении сове
 по договорённости уже приведён к 16 кГц моно pcm_s16le, так что декодер не нужен
 вовсе; файл другого формата уходит в pyannote путём, как раньше.
 
-Прогон на CPU идёт примерно в реальном времени: на лекции 02:35:29 это десятки
-минут. Поэтому pyannote получает hook, и каждый шаг с его прогрессом печатается
-в stdout — иначе прогон выглядит зависшим.
+На CPU прогон идёт примерно в реальном времени (10-минутный фрагмент — 10:25),
+то есть лекция 02:35:29 считается часами. На видеоядре Mac (mps) та же лекция
+заняла 14:42, а разметка на фрагменте совпала с CPU до миллисекунды — замер
+2026-10-04 на Apple M5. Поэтому по умолчанию --device auto: видеоядро, если оно
+есть. И поэтому pyannote получает hook: каждый шаг печатается с прогрессом,
+прошедшим и оставшимся временем, а в конце — сколько он занял (они же лежат в
+stats.step_seconds). Иначе прогон выглядит зависшим.
 
 Зависимости: pyannote.audio, torch и torchaudio, но они импортируются лениво,
 внутри функции прогона. --help и --selftest работают без них, без весов, без
@@ -60,6 +64,7 @@ import platform
 import sys
 import tempfile
 import time
+import warnings
 import wave
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -68,7 +73,7 @@ PROG = "diarize.py"
 SCHEMA = "diarization/1"
 
 DEFAULT_MODEL = "pyannote/speaker-diarization-community-1"
-DEFAULT_DEVICE = "cpu"
+DEFAULT_DEVICE = "auto"
 
 # Кэш Hugging Face: $HF_HOME, иначе ~/.cache/huggingface. Внутри него библиотека
 # huggingface_hub держит скачанные репозитории в подкаталоге hub/ — туда и
@@ -129,8 +134,9 @@ scripts/lib/common.sh. Инструмент не вызывает ffmpeg и ни
   --cache-dir <кат>  каталог кэша Hugging Face: внутри него ищется
                      hub/models--<org>--<имя>/snapshots/<снапшот>/%(pipeline)s
                      (по умолчанию $HF_HOME, иначе %(cache)s)
-  --device <устр>    устройство для torch: cpu, mps, cuda
-                     (по умолчанию %(device)s)
+  --device <устр>    устройство для torch: auto, cpu, mps, cuda; auto берёт
+                     cuda, иначе mps (видеоядро Mac), иначе cpu — выбранное
+                     пишется в device файла (по умолчанию %(device)s)
   --min-speakers <N> нижняя граница числа говорящих, если она известна
   --max-speakers <N> верхняя граница числа говорящих, если она известна
   --selftest         прогнать встроенные проверки и выйти (без pyannote, torch,
@@ -182,6 +188,16 @@ def format_hms(seconds: float) -> str:
     hours, rest = divmod(total, 3600.0)
     minutes, secs = divmod(rest, 60.0)
     return "%02d:%02d:%06.3f" % (int(hours), int(minutes), secs)
+
+
+def format_clock(seconds: float) -> str:
+    """Секунды в М:СС или Ч:ММ:СС — для прогресса, где миллисекунды только мешают."""
+    total = int(round(max(0.0, float(seconds))))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
 
 
 def r3(value: float) -> float:
@@ -385,12 +401,17 @@ def prepare_env(cache_dir: str) -> dict:
                                 (см. pyannote/audio/telemetry/config.yaml).
                                 Инструмент обещает не ходить в сеть — значит и
                                 этого быть не должно.
+      PYTORCH_ENABLE_MPS_FALLBACK операция, которой нет в бэкенде MPS, уходит
+      =1                        на CPU, а не роняет прогон на видеоядре Apple.
+                                На других устройствах ни на что не влияет; torch
+                                читает её при импорте.
     """
     values = {
         "HF_HUB_OFFLINE": "1",
         "HF_HOME": cache_dir,
         "HF_HUB_CACHE": hub_dir(cache_dir),
         "PYANNOTE_METRICS_ENABLED": "false",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
     }
     os.environ.update(values)
     return values
@@ -623,10 +644,16 @@ def build_payload(
     speakers: list,
     elapsed_seconds: float,
     model_load_seconds: float,
+    step_seconds=None,
     min_speakers=None,
     max_speakers=None,
 ) -> dict:
-    """Собирает объект схемы diarization/1. Поля — ровно те, что в схеме."""
+    """Собирает объект схемы diarization/1. Поля — ровно те, что в схеме.
+
+    step_seconds — длительность шагов pyannote по их исходным именам
+    (segmentation, embeddings, …): по ним сравниваются прогоны на разных
+    устройствах. Нет сведений — пустой словарь.
+    """
     intervals = [(turn["start"], turn["end"]) for turn in turns]
     stats = {
         "turns": len(turns),
@@ -635,6 +662,7 @@ def build_payload(
         "overlap_seconds": r3(overlap_seconds(intervals)),
         "elapsed_seconds": r3(elapsed_seconds),
         "model_load_seconds": r3(model_load_seconds),
+        "step_seconds": {name: r3(value) for name, value in (step_seconds or {}).items()},
         "device": device,
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
@@ -697,8 +725,13 @@ def print_report(path: str, payload: dict, dropped: int) -> None:
                 100.0 * speaker["share"],
             )
         )
+    sys.stdout.write("Устройство:       %s\n" % stats["device"])
     sys.stdout.write("Загрузка модели:  %.2f с\n" % stats["model_load_seconds"])
     sys.stdout.write("Время прогона:    %.2f с\n" % stats["elapsed_seconds"])
+    for name, seconds in stats["step_seconds"].items():
+        sys.stdout.write(
+            "  %-22s %s\n" % (STEP_NAMES.get(name, name) + ":", format_clock(seconds))
+        )
     sys.stdout.write("Файл:             %s\n" % path)
 
 
@@ -711,29 +744,69 @@ class ProgressHook:
     pyannote зовёт hook как hook(шаг, артефакт, file=..., completed=..., total=...)
     и на длинных шагах делает это много раз подряд. Печатать каждый вызов нельзя
     (run.log распухнет на тысячи строк), поэтому внутри шага выводится каждые
-    10% и обязательно последняя строка.
+    10%. В строке — сколько шаг уже идёт и сколько ему осталось при той же
+    скорости: по двум соседним строкам видно, что прогон не завис.
+
+    Длительность шага считается от последнего вызова предыдущего шага до
+    последнего вызова этого: pyannote в конце каждого шага зовёт hook ещё раз,
+    уже с готовым артефактом. Короткие шаги без прогресса (подсчёт говорящих)
+    так получают своё время, а не растворяются в соседнем. Последний шаг
+    закрывает finish(). Итог копится в step_seconds по исходным именам шагов.
+
+    completed у pyannote бывает больше total — счётчик прибавляет батч целиком
+    (pyannote/audio/core/inference.py), — поэтому для вывода он зажимается.
     """
 
-    def __init__(self, stream=None):
+    def __init__(self, stream=None, clock=time.perf_counter):
         self.stream = stream if stream is not None else sys.stdout
+        self.clock = clock
         self.step = None
         self.bucket = -1
+        self.mark = clock()
+        self.last = self.mark
+        self.step_seconds: dict = {}
 
     def __call__(self, step_name, step_artefact=None, file=None, total=None,
                  completed=None, **kwargs):
+        now = self.clock()
         if step_name != self.step:
+            self._close_step(self.last)
             self.step = step_name
             self.bucket = -1
             self.stream.write("  шаг: %s\n" % STEP_NAMES.get(step_name, step_name))
             self.stream.flush()
+        self.last = now
         if not total or completed is None:
             return
+        completed = min(completed, total)
         percent = int(100.0 * completed / total)
         bucket = percent // 10
-        if bucket > self.bucket or completed >= total:
-            self.bucket = bucket
-            self.stream.write("    %3d%% (%d из %d)\n" % (percent, completed, total))
-            self.stream.flush()
+        if bucket <= self.bucket:
+            return
+        self.bucket = bucket
+        line = "    %3d%% (%d из %d)" % (percent, completed, total)
+        if completed > 0:
+            elapsed = now - self.mark
+            line += ", прошло %s" % format_clock(elapsed)
+            if completed < total:
+                left = elapsed * (total - completed) / completed
+                line += ", осталось ~%s" % format_clock(left)
+        self.stream.write(line + "\n")
+        self.stream.flush()
+
+    def finish(self) -> None:
+        """Закрывает последний шаг: после него pyannote hook уже не зовёт."""
+        self._close_step(self.clock())
+        self.step = None
+
+    def _close_step(self, end: float) -> None:
+        if self.step is None:
+            return
+        seconds = max(0.0, end - self.mark)
+        self.step_seconds[self.step] = self.step_seconds.get(self.step, 0.0) + seconds
+        self.mark = end
+        self.stream.write("    шаг занял %s\n" % format_clock(seconds))
+        self.stream.flush()
 
 
 def load_audio(path: str):
@@ -776,6 +849,22 @@ def load_audio(path: str):
     }
 
 
+def resolve_device(requested: str, *, cuda_available, mps_available) -> str:
+    """auto — первое доступное из cuda, mps, cpu; любое другое значение как есть.
+
+    Проверки доступности передаются функциями: так auto проверяется селф-тестом
+    без torch, а при настоящем прогоне torch спрашивается лишь тогда, когда
+    устройство и правда надо выбрать.
+    """
+    if requested != "auto":
+        return requested
+    if cuda_available():
+        return "cuda"
+    if mps_available():
+        return "mps"
+    return "cpu"
+
+
 def diarize_with_pyannote(
     source: str,
     *,
@@ -784,13 +873,24 @@ def diarize_with_pyannote(
     device: str,
     min_speakers=None,
     max_speakers=None,
-) -> tuple[list, float]:
-    """Прогон pyannote. Возвращает (список (start, end, метка), время загрузки).
+) -> tuple[list, dict]:
+    """Прогон pyannote. Возвращает (список (start, end, метка), сведения о прогоне).
+
+    Сведения — словарь: model_load_seconds, device (фактическое, auto уже
+    раскрыт) и step_seconds (длительность каждого шага пайплайна).
 
     Тяжёлые импорты живут здесь и только здесь: --help и --selftest обязаны
     работать без pyannote, torch и torchaudio.
     """
     prepare_env(cache_dir)
+
+    # torchcodec не нужен: звук подаётся в память (см. load_audio), а если всё же
+    # уйдёт путём и декодер не загрузится, об этом скажет _apply_failure. Без
+    # фильтра pyannote ещё при импорте сыплет в run.log полсотни строк
+    # трейсбека про libavutil, неотличимых от аварии.
+    warnings.filterwarnings(
+        "ignore", message=r"\s*torchcodec is not installed correctly", category=UserWarning
+    )
 
     try:
         import torch
@@ -816,6 +916,11 @@ def diarize_with_pyannote(
             "снапшоте нет %s или он неполный" % (model, cache_dir, PIPELINE_FILE)
         )
 
+    device = resolve_device(
+        device,
+        cuda_available=torch.cuda.is_available,
+        mps_available=torch.backends.mps.is_available,
+    )
     try:
         pipeline.to(torch.device(device))
     except Exception as exc:  # noqa: BLE001 — кривое устройство это код 2, а не трейсбек
@@ -824,10 +929,10 @@ def diarize_with_pyannote(
             % (device, type(exc).__name__, exc)
         ) from None
     model_load_seconds = time.perf_counter() - started
-    sys.stdout.write("Модель загружена за %.2f с\n" % model_load_seconds)
+    sys.stdout.write("Модель загружена за %.2f с, устройство %s\n" % (model_load_seconds, device))
     sys.stdout.flush()
 
-    kwargs: dict = {"hook": ProgressHook()}
+    kwargs: dict = {}
     if min_speakers is not None:
         kwargs["min_speakers"] = min_speakers
     if max_speakers is not None:
@@ -842,12 +947,28 @@ def diarize_with_pyannote(
         )
         audio = None
 
+    # Пулинг эмбеддингов считает std по кадрам, и на окне, где говорящему
+    # досталось не больше кадра, torch предупреждает о нуле степеней свободы.
+    # На результат это не влияет, а в run.log выглядит как авария.
+    warnings.filterwarnings(
+        "ignore", message=r"std\(\): degrees of freedom", category=UserWarning
+    )
+
+    # Hook заводится прямо перед прогоном: от его создания отсчитывается
+    # первый шаг, и загрузка модели со звуком туда попадать не должна.
+    hook = ProgressHook()
     try:
-        output = pipeline(audio if audio is not None else source, **kwargs)
+        output = pipeline(audio if audio is not None else source, hook=hook, **kwargs)
     except Exception as exc:  # noqa: BLE001 — падение модели это код 2
         raise ToolError(_apply_failure(source, exc)) from None
+    hook.finish()
 
-    return list(extract_turns(output)), model_load_seconds
+    info = {
+        "model_load_seconds": model_load_seconds,
+        "device": device,
+        "step_seconds": hook.step_seconds,
+    }
+    return list(extract_turns(output)), info
 
 
 def _apply_failure(source: str, exc: Exception) -> str:
@@ -947,7 +1068,7 @@ def run(opts: dict, diarize=None) -> int:
     sys.stdout.write("Кэш:     %s\n" % snapshot)
     sys.stdout.flush()
 
-    raw, model_load_seconds = (diarize or diarize_with_pyannote)(
+    raw, info = (diarize or diarize_with_pyannote)(
         source,
         model=opts["model"],
         cache_dir=cache_dir,
@@ -963,11 +1084,14 @@ def run(opts: dict, diarize=None) -> int:
         source=source,
         duration=duration,
         model=opts["model"],
-        device=opts["device"],
+        # В файл идёт устройство, на котором считали, а не просьба: auto
+        # раскрывается внутри прогона.
+        device=info.get("device", opts["device"]),
         turns=turns,
         speakers=speakers,
         elapsed_seconds=time.perf_counter() - started,
-        model_load_seconds=model_load_seconds,
+        model_load_seconds=info["model_load_seconds"],
+        step_seconds=info.get("step_seconds"),
         min_speakers=opts["min_speakers"],
         max_speakers=opts["max_speakers"],
     )
@@ -1163,7 +1287,7 @@ def _fake_diarize(raw, load_seconds: float = 1.5):
     """Подделка прогона pyannote: отдаёт заранее заданные интервалы."""
 
     def diarize(source, *, model, cache_dir, device, min_speakers=None, max_speakers=None):
-        return list(raw), load_seconds
+        return list(raw), {"model_load_seconds": load_seconds}
 
     return diarize
 
@@ -1305,7 +1429,8 @@ def _test_package_preflight() -> None:
 def _test_offline_env() -> None:
     """Перед импортом pyannote окружение переводится в офлайн, телеметрия гасится."""
     with _environment(
-        HF_HUB_OFFLINE=None, HF_HOME=None, HF_HUB_CACHE=None, PYANNOTE_METRICS_ENABLED=None
+        HF_HUB_OFFLINE=None, HF_HOME=None, HF_HUB_CACHE=None, PYANNOTE_METRICS_ENABLED=None,
+        PYTORCH_ENABLE_MPS_FALLBACK=None,
     ):
         values = prepare_env("/кэш/проекта")
         _check(os.environ["HF_HUB_OFFLINE"] == "1", os.environ.get("HF_HUB_OFFLINE"))
@@ -1320,6 +1445,11 @@ def _test_offline_env() -> None:
             os.environ.get("PYANNOTE_METRICS_ENABLED"),
         )
         _check(values["HF_HUB_OFFLINE"] == "1", values)
+        # Без фолбэка операция, которой нет в MPS, роняет прогон на видеоядре.
+        _check(
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1",
+            os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"),
+        )
 
     # Уже выставленное снаружи HF_HUB_OFFLINE=0 перебивается: обещание «не качаем»
     # не должно зависеть от окружения вызывающего.
@@ -1481,9 +1611,11 @@ def _test_payload() -> None:
     stats = payload["stats"]
     for key in (
         "turns", "speakers", "speech_seconds", "overlap_seconds", "elapsed_seconds",
-        "device", "pyannote_audio_version", "torch_version", "python_version",
+        "step_seconds", "device", "pyannote_audio_version", "torch_version",
+        "python_version",
     ):
         _check(key in stats, "в stats нет %r: %s" % (key, sorted(stats)))
+    _check(stats["step_seconds"] == {}, "без сведений о шагах — пустой словарь: %r" % stats)
     _check(stats["turns"] == 3 and stats["speakers"] == 2, stats)
     _check(stats["speech_seconds"] == 25.0, stats["speech_seconds"])
     _check(stats["overlap_seconds"] == 2.0, stats["overlap_seconds"])
@@ -1575,7 +1707,7 @@ def _test_exit_codes() -> None:
             seen.update(
                 {"min": min_speakers, "max": max_speakers, "device": device, "model": model}
             )
-            return [(0.0, 1.0, "SPEAKER_00")], 0.1
+            return [(0.0, 1.0, "SPEAKER_00")], {"model_load_seconds": 0.1}
 
         code, _, _ = _run(
             argv + ["--min-speakers", "2", "--max-speakers=4", "--device", "mps",
@@ -1589,6 +1721,31 @@ def _test_exit_codes() -> None:
         _check(payload["stats"]["min_speakers"] == 2, payload["stats"])
         _check(payload["stats"]["max_speakers"] == 4, payload["stats"])
         _check(payload["device"] == "mps", payload["device"])
+
+        # --device auto: в файл и в отчёт попадает устройство, которое выбрал
+        # прогон, а не слово auto; длительности шагов доезжают до stats.
+        def on_mps(source_path, *, model, cache_dir, device, min_speakers=None,
+                   max_speakers=None):
+            seen["device"] = device
+            return [(0.0, 1.0, "SPEAKER_00")], {
+                "model_load_seconds": 0.1,
+                "device": "mps",
+                "step_seconds": {"segmentation": 61.23456, "embeddings": 300.0},
+            }
+
+        code, report, _ = _run(argv + ["--device", "auto"], diarize=on_mps)
+        _check(code == 0, code)
+        _check(seen["device"] == "auto", "auto не дошёл до прогона: %r" % seen["device"])
+        with open(out, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        _check(payload["device"] == "mps", payload["device"])
+        _check(payload["stats"]["device"] == "mps", payload["stats"])
+        _check(
+            payload["stats"]["step_seconds"] == {"segmentation": 61.235, "embeddings": 300.0},
+            payload["stats"]["step_seconds"],
+        )
+        for needle in ("Устройство:       mps", "сегментация:", "1:01", "векторы голосов:", "5:00"):
+            _check(needle in report, "в отчёте нет %r:\n%s" % (needle, report))
 
         # Не 16 кГц моно — предупреждение, но прогон идёт.
         stereo = _make_wav(os.path.join(tmp, "стерео.wav"), seconds=3.0, rate=8000, channels=2)
@@ -1693,22 +1850,74 @@ def _test_failure_messages() -> None:
 
 
 def _test_progress_hook() -> None:
-    """Прогресс печатается по шагам и не чаще, чем раз в 10%."""
+    """Прогресс по шагам: не чаще раза в 10%, со временем, остатком и итогом шага."""
+    now = [0.0]
     stream = io.StringIO()
-    hook = ProgressHook(stream=stream)
-    hook("segmentation", None, file={})
+    hook = ProgressHook(stream=stream, clock=lambda: now[0])
+    # Сегментация: 100 порций по 6 секунд, как вызывает pyannote — сначала 0,
+    # потом с перебором на последнем батче, в конце ещё раз с артефактом.
+    hook("segmentation", None, file={}, completed=0, total=100)
     for completed in range(1, 101):
+        now[0] = 6.0 * completed
         hook("segmentation", None, file={}, completed=completed, total=100)
-    hook("embeddings", None, file={})
+    hook("segmentation", None, file={}, completed=104, total=100)
+    hook("segmentation", "артефакт")
+    # Подсчёт говорящих прогресса не шлёт: один вызов уже по готовности.
+    now[0] = 610.0
+    hook("speaker_counting", "артефакт")
+    now[0] = 611.0
+    hook("embeddings", None, file={}, completed=0, total=10)
+    now[0] = 641.0
+    hook("embeddings", None, file={}, completed=3, total=10)
     hook("неведомый шаг", None, file={})
+    now[0] = 700.0
+    hook.finish()
     text = stream.getvalue()
 
     _check("шаг: сегментация" in text, text)
+    _check("шаг: подсчёт говорящих" in text, text)
     _check("шаг: векторы голосов" in text, text)
     _check("шаг: неведомый шаг" in text, "незнакомый шаг печатается как есть:\n%s" % text)
-    _check("100% (100 из 100)" in text, "последняя строка прогресса не напечатана:\n%s" % text)
-    lines = [line for line in text.splitlines() if line.strip().endswith(")")]
-    _check(len(lines) <= 12, "прогресс печатается слишком часто: %d строк" % len(lines))
+    _check("100% (100 из 100), прошло 10:00\n" in text,
+           "последняя строка прогресса не напечатана или без времени:\n%s" % text)
+    _check("из 100)" in text and "104 из 100" not in text,
+           "перебор completed над total не зажат:\n%s" % text)
+    _check(text.count("100% (100 из 100)") == 1, "100%% напечатано больше раза:\n%s" % text)
+    _check("50% (50 из 100), прошло 5:00, осталось ~5:00" in text,
+           "в строке прогресса нет прошедшего и оставшегося времени:\n%s" % text)
+    # Векторы голосов считаются от конца подсчёта говорящих (610), а не от
+    # начала прогона: 3 из 10 за 31 с — осталось ~72 с.
+    _check("30% (3 из 10), прошло 0:31, осталось ~1:12" in text, text)
+    progress = [line for line in text.splitlines() if "%" in line]
+    _check(len(progress) <= 14, "прогресс печатается слишком часто: %d строк" % len(progress))
+
+    _check(
+        hook.step_seconds == {
+            "segmentation": 600.0,
+            "speaker_counting": 10.0,
+            "embeddings": 31.0,
+            "неведомый шаг": 59.0,
+        },
+        "длительности шагов: %r" % hook.step_seconds,
+    )
+    _check(text.count("шаг занял") == 4, "итог печатается не у каждого шага:\n%s" % text)
+    _check("шаг занял 10:00" in text, text)
+
+
+def _test_resolve_device() -> None:
+    """--device auto: cuda, иначе mps, иначе cpu; явное значение не трогается."""
+    yes, no = (lambda: True), (lambda: False)
+    _check(resolve_device("auto", cuda_available=no, mps_available=yes) == "mps", "auto на Mac")
+    _check(resolve_device("auto", cuda_available=yes, mps_available=yes) == "cuda", "auto с cuda")
+    _check(resolve_device("auto", cuda_available=no, mps_available=no) == "cpu", "auto без ускорителя")
+
+    def boom():
+        raise AssertionError("доступность не должна спрашиваться при явном устройстве")
+
+    _check(resolve_device("cpu", cuda_available=boom, mps_available=boom) == "cpu", "cpu")
+    _check(resolve_device("mps", cuda_available=boom, mps_available=boom) == "mps", "mps")
+    _check(format_clock(59.6) == "1:00", format_clock(59.6))
+    _check(format_clock(3725) == "1:02:05", format_clock(3725))
 
 
 def _test_help() -> None:
@@ -1765,6 +1974,7 @@ def selftest() -> int:
         ("код 2 не трогает --out", _test_code_two_keeps_out),
         ("сообщения о неудачах прогона", _test_failure_messages),
         ("прогресс прогона", _test_progress_hook),
+        ("выбор устройства --device auto", _test_resolve_device),
         ("справка", _test_help),
         ("ленивые импорты", _test_lazy_imports),
     )

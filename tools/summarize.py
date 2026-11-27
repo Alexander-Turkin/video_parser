@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""summarize.py — саммари записи одним вызовом claude.
+"""summarize.py — саммари записи через локальную Ollama.
 
 На вход — файл схемы punctuated/1 (его пишет tools/punctuate.py: предложения с
 таймкодами) или, как подстраховка, transcript/1 от tools/transcribe.py (там
@@ -42,20 +42,12 @@
 итоговый документ tools/render_doc.py под готовый заголовок «## Саммари», и свой
 заголовок верхнего уровня здесь испортил бы структуру документа.
 
-Вызов claude — ровно один и по всему тексту сразу (решение владельца: «саммари
-отдельным вызовом по всему тексту»). Карты-свёртки по частям здесь нет: саммари
-по саммари теряет именно то, за чем его читают, — связь между началом и концом
-разговора. Расплата за это — предел длины аргумента командной строки: промпт
-полной двухчасовой записи может в него не влезть, и тогда claude_cli поднимает
-ClaudeFailed, а инструмент честно пишет «не получено» с этой причиной.
+Длинная запись делится по таймкодам на части; списочные разделы объединяются
+без перефразирования, а изложение сводится отдельным локальным запросом.
+Если модель недоступна, фрагмент всё равно пишется с пометкой и кодом 1.
+Код 2 оставлен для непригодного входа: --out не создаётся.
 
-Главное свойство: фрагмент пишется всегда, даже если claude недоступен, не
-авторизован, не ответил или ответил не тем. Расшифровка стоит двух часов
-распознавания, и терять её из-за саммари нельзя — поэтому «не получено» это
-пометка в файле и код возврата 1, а не отсутствие файла. Код 2 оставлен для
-непригодного входа: там --out не создаётся и существующий файл не перетирается.
-
-Почему ответ claude не кладётся в файл дословно. Из восьми разделов собирается
+Почему ответ ollama не кладётся в файл дословно. Из восьми разделов собирается
 ровно та структура, которую ждёт сборщик документа: заголовки приводятся к
 «###», строки списков — к виду «- [ЧЧ:ММ:СС] текст». Слова при этом не
 переписываются: меняется только разметка вокруг них. Если же все восемь разделов
@@ -65,7 +57,7 @@ ClaudeFailed, а инструмент честно пишет «не получ�
 предупреждение, а код возврата остаётся нулевым — саммари всё-таки получено.
 
 Кто что сказал. С --speakers (файл схемы speakers/1 от tools/speakers.py, при
-желании вместе с --roles от tools/roles.py) расшифровка подаётся claude не
+желании вместе с --roles от tools/roles.py) расшифровка подаётся ollama не
 предложениями, а фразами говорящих — строками «[ЧЧ:ММ:СС] Ярлык: текст», — и
 промпт требует ярлык в двух разделах из восьми: в «Домашних заданиях» и в
 «Решениях, задачах, договорённостях». Ровно в двух, потому что имя отвечающего
@@ -74,22 +66,23 @@ ClaudeFailed, а инструмент честно пишет «не получ�
 книгу, читателю не важно, а ярлык в каждой строке превратил бы саммари в
 протокол. Без --speakers промпт и фрагмент не меняются ни на байт.
 
-Негодный speakers/1 или roles/1 саммари не отменяет: о беде говорится в stderr,
-и работа идёт по старому пути — по предложениям punctuated/1 и без ярлыков.
-Саммари дороже ярлыков, а повторить вызов claude нечем.
+Негодный speakers/1 или roles/1 саммари не отменяет: причина уходит в stderr,
+и работа продолжается по предложениям punctuated/1 без ярлыков.
 
-Зависимости: только стандартная библиотека. Сам claude запускается через
-tools/claude_cli.py — это единственное место в проекте, где собирается его
-командная строка; своего subprocess здесь нет. Формат таймкода берётся оттуда
+Зависимости: только стандартная библиотека. Модель вызывается через
+tools/ollama_client.py по локальному HTTP; своего subprocess здесь нет. Формат таймкода берётся оттуда
 же, откуда его читает сборщик документа, — из tools/render_doc.py, чтобы
 «[01:02:03]» в саммари и в расшифровке означало одно и то же; оттуда же взяты
 разбор speakers/1 и roles/1 и правило, каким ярлыком подписывать фразу
 (load_speakers, load_roles, speaker_label), — иначе две половины одного
 документа понимали бы эти файлы по-разному.
 
+Длинная запись делится по таймкодам на части;
+списочные разделы объединяются без перефразирования, а изложение сводится
+отдельным запросом. Промпты передаются локальному серверу по HTTP на 127.0.0.1.
+
 Проверки живут в самом файле (--selftest): в окружении проекта нет pytest.
-Установленный claude для них не нужен и намеренно не используется — все вызовы
-идут на подставных sh-скриптах.
+Ollama для них не нужна: их ответы подставляются тестовыми заглушками.
 
 Использование:
   python tools/summarize.py --punctuated <файл.json> --out <файл.md>
@@ -117,7 +110,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-import claude_cli  # noqa: E402 — импорт возможен только после правки sys.path выше
+import ollama_client  # noqa: E402
 
 # Формат таймкода, разбор speakers/1 и roles/1 и правило выбора ярлыка берутся у
 # сборщика документа: саммари и расшифровка в одном файле обязаны понимать эти
@@ -199,21 +192,21 @@ NOTHING = "- не прозвучало"
 # Так записывается домашнее задание, срок которого в записи не прозвучал.
 DEADLINE_UNKNOWN = "не назван"
 
-# Строка для списков в случае, когда восемь разделов в ответе claude не нашлись
+# Строка для списков в случае, когда восемь разделов в ответе ollama не нашлись
 # и весь ответ ушёл в «Изложение»: врать «не прозвучало» здесь нельзя —
 # неизвестно, прозвучало или нет.
-NOT_PARSED = "- не выделено: восемь разделов в ответе claude не найдены, см. «Изложение»"
+NOT_PARSED = "- не выделено: восемь разделов в ответе ollama не найдены, см. «Изложение»"
 
-# Уровень, до которого опускаются заголовки, пришедшие из ответа claude:
+# Уровень, до которого опускаются заголовки, пришедшие из ответа ollama:
 # разделы фрагмента занимают «###», всё внутри них стоит ниже.
 INNER_HEADING_LEVEL = 4
 
 # Границы связного изложения из критериев приёмки. Выход за них не ошибка —
-# переписывать текст claude инструмент не вправе, — но о нём говорится в stderr.
+# переписывать текст ollama инструмент не вправе, — но о нём говорится в stderr.
 OVERVIEW_MIN_PARAGRAPHS = 3
 OVERVIEW_MAX_PARAGRAPHS = 8
 
-# Префикс имён файлов лога вызова (tools/claude_cli.py кладёт <tag>-NNN.*.txt).
+# Префикс имён файлов лога вызова (tools/ollama_client.py кладёт <tag>-NNN.*.txt).
 LOG_TAG = "саммари"
 
 HELP = """Использование:
@@ -223,7 +216,7 @@ HELP = """Использование:
   python tools/summarize.py --transcript <файл.json> --out <файл.md> [опции]
   python tools/summarize.py --selftest
 
-Делает саммари записи одним вызовом claude по всему тексту и пишет
+Делает саммари записи через локальную Ollama и пишет
 markdown-фрагмент с восемью разделами уровня «###», всегда в этом порядке:
 
   «Изложение»                        связный текст, 3–8 абзацев, без списков
@@ -252,8 +245,8 @@ markdown-фрагмент с восемью разделами уровня «##
 сегодняшнего числа инструмент не знает.
 
 В промпт текст подаётся строками «[ЧЧ:ММ:СС] предложение», и промпт требует
-брать таймкоды только из этих строк. Сам claude запускается через
-tools/claude_cli.py как `claude -p <промпт>`; модель не задаётся.
+брать таймкоды только из этих строк. Сам ollama запускается через
+tools/ollama_client.py по HTTP на 127.0.0.1; модель задаётся `--ollama-model`.
 
 С --speakers расшифровка подаётся в промпт не предложениями, а фразами
 говорящих — строками «[ЧЧ:ММ:СС] Ярлык: текст», — и промпт требует ярлык в двух
@@ -262,7 +255,7 @@ tools/claude_cli.py как `claude -p <промпт>`; модель не зад�
 Остальные шесть разделов не меняются: ярлыков в них нет, и в «Сроках и
 дедлайнах» по-прежнему повторяется срок из строки домашнего задания. Ярлык —
 это роль из --roles, а без него имя говорящего («Говорящий 1»); у фразы, за
-которой говорящего нет, ярлыка нет тоже. Если claude ярлык в строке не
+которой говорящего нет, ярлыка нет тоже. Если ollama ярлык в строке не
 поставил, строка всё равно попадает во фрагмент, а число таких строк — в
 stderr. Негодный speakers/1 или roles/1 саммари не отменяет: о беде говорится в
 stderr, и оно делается по предложениям --punctuated, без ярлыков.
@@ -280,12 +273,13 @@ stderr, и оно делается по предложениям --punctuated, �
                        «Говорящий N → Преподаватель». Без него ярлык — имя
                        говорящего; без --speakers файл не используется
   --out <файл>         куда записать markdown-фрагмент (обязателен)
-  --timeout <сек>      сколько ждать один вызов claude (по умолчанию {timeout:g})
+  --ollama-model <имя> локальная модель (по умолчанию qwen3:8b)
+  --timeout <сек>      сколько ждать один вызов модели (по умолчанию {timeout:g})
   --attempts <N>       сколько попыток вызова делать (по умолчанию {attempts};
-                       повтор бывает только на таймауте и ненулевом коде)
-  --log-dir <каталог>  куда tools/claude_cli.py положит промпт и ответ
+                       повтор бывает только при сбое запроса)
+  --log-dir <каталог>  куда положить промпт и ответ
                        ({tag}-NNN.prompt.txt и {tag}-NNN.response.txt)
-  --selftest           прогнать встроенные проверки и выйти (claude не нужен)
+  --selftest           прогнать встроенные проверки и выйти (ollama не нужен)
   -h, --help           показать эту справку
 
 Каталог для --out создаётся при необходимости, файл пишется в UTF-8.
@@ -293,23 +287,25 @@ stderr, и оно делается по предложениям --punctuated, �
 Коды возврата:
   0  саммари получено и записано (в том числе когда восемь разделов в ответе не
      нашлись и ответ сохранён как есть под «### Изложение»)
-  1  саммари не получено (нет claude, не авторизован, таймаут, ненулевой код,
+  1  саммари не получено (модель недоступна, таймаут, негодный ответ,
      пустой ответ, слишком длинный промпт) — файл записан с пометкой и причиной
   2  вход непригоден (нет файла, не та схема, нет предложений) или ошибка в
      аргументах — файл --out не создаётся и не перетирается
 
 Примеры:
   python tools/summarize.py --punctuated data/output/лекция/punctuated.json \\
-      --out data/output/лекция/summary.md --log-dir data/output/лекция/claude
+      --out data/output/лекция/summary.md --log-dir data/output/лекция/ollama
   python tools/summarize.py --punctuated data/output/лекция/punctuated.json \\
       --speakers data/output/лекция/speakers.json \\
       --roles data/output/лекция/roles.json \\
       --out data/output/лекция/summary.md
   python tools/summarize.py --transcript data/output/лекция/transcript.json \\
       --out data/output/лекция/summary.md --timeout 600
+  python tools/summarize.py --punctuated data/output/лекция/punctuated.json \\
+      --out data/output/лекция/summary.md --ollama-model qwen3:8b
 """.format(
-    timeout=claude_cli.DEFAULT_TIMEOUT,
-    attempts=claude_cli.DEFAULT_ATTEMPTS,
+    timeout=ollama_client.DEFAULT_TIMEOUT,
+    attempts=ollama_client.DEFAULT_ATTEMPTS,
     tag=LOG_TAG,
     unknown=DEADLINE_UNKNOWN,
 )
@@ -360,12 +356,12 @@ class Record:
     """То, что инструменту нужно от входного файла.
 
     duration — длина записи в секундах, если она в файле есть; по ней видно,
-    что таймкод в ответе claude выдуман (ушёл за конец записи).
+    что таймкод в ответе ollama выдуман (ушёл за конец записи).
 
     labels — ярлыки говорящих этой записи в порядке первого появления. Пустой
     список означает «ярлыков нет»: так и без --speakers, и с ним, если
     диаризация не дала говорящего ни одной фразе. По этому же списку потом
-    проверяется, поставил ли claude ярлык в строке, — чужой ярлык в саммари
+    проверяется, поставил ли ollama ярлык в строке, — чужой ярлык в саммари
     такой же выдуманный факт, как чужой таймкод.
     """
 
@@ -465,7 +461,7 @@ def _parse_items(data: dict, key: str, what: str) -> list[dict]:
 def _lines_from(items: list[dict], what: str) -> list[Line]:
     """Превращает предложения (или сегменты) в строки промпта.
 
-    Пустой текст пропускается: строка из одного таймкода claude ничего не
+    Пустой текст пропускается: строка из одного таймкода ollama ничего не
     скажет, а падать из-за неё незачем. Если пустыми окажутся все — об этом
     скажет вызывающий, там это уже непригодный вход.
     """
@@ -547,7 +543,7 @@ def apply_speakers(record: Record, opts: dict) -> Record:
     Беда speakers/1 или roles/1 саммари не отменяет: о ней говорится в stderr, и
     возвращается тот же record, что пришёл, — промпт собирается по предложениям
     punctuated/1 и без ярлыков. Саммари дороже ярлыков: распознавание записи
-    стоит двух часов, а второго вызова claude здесь нет.
+    стоит двух часов, а второго вызова ollama здесь нет.
 
     Разбор обоих файлов и выбор ярлыка взяты у tools/render_doc.py: в итоговом
     документе саммари и расшифровка стоят рядом, и «Преподаватель» в них обязан
@@ -628,7 +624,7 @@ PROMPT_INTRO = """Сделай саммари рабочей записи (ле�
 
 # То же вступление, когда в расшифровке есть ярлыки говорящих. Отдельным
 # текстом, а не вставкой в прежний: строка расшифровки описывается здесь один
-# раз, и описание обязано совпадать с тем, что claude увидит ниже.
+# раз, и описание обязано совпадать с тем, что ollama увидит ниже.
 PROMPT_INTRO_LABELLED = """Сделай саммари рабочей записи (лекция или рабочий созвон).
 
 Ниже — расшифровка записи: каждая строка это одно высказывание с таймкодом и
@@ -768,15 +764,15 @@ def build_prompt(record: Record) -> str:
 # «#тема» в тексте сошло бы за заголовок.
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 
-# Жирная строка целиком — claude иногда помечает разделы так вместо заголовка.
+# Жирная строка целиком — ollama иногда помечает разделы так вместо заголовка.
 BOLD_RE = re.compile(r"^\*\*(.+?)\*\*:?$")
 
 # Таймкод в строке списка: сначала ищем ЧЧ:ММ:СС, потом ММ:СС. Квадратные скобки
-# необязательны — claude мог их потерять, а выбрасывать из-за этого тему жалко.
+# необязательны — ollama мог их потерять, а выбрасывать из-за этого тему жалко.
 TIME_HMS_RE = re.compile(r"\[?\s*(\d{1,4}):([0-5]?\d):([0-5]?\d)\s*\]?")
 TIME_MS_RE = re.compile(r"\[?\s*(\d{1,4}):([0-5]?\d)\s*\]?")
 
-# Маркеры списка и знаки, которыми claude отделяет таймкод от текста.
+# Маркеры списка и знаки, которыми ollama отделяет таймкод от текста.
 BULLET_RE = re.compile(r"^\s*(?:[-*•+]|\d{1,3}[.)])\s*")
 SEPARATOR_RE = re.compile(r"^\s*[—–:-]+\s*")
 
@@ -798,7 +794,7 @@ HOMEWORK_LINE_RE = re.compile(r"^- \[[^\]]+\] (?P<task>.+?) — срок: (?P<de
 
 # Ярлык в начале пункта: «Преподаватель: прочитать главу». Что стоит до первого
 # двоеточия, сверяется потом со списком ярлыков записи — иначе за ярлык сошло бы
-# любое «Решение:» или «Вывод:», написанное claude от себя.
+# любое «Решение:» или «Вывод:», написанное ollama от себя.
 LABEL_RE = re.compile(r"^(?P<label>[^:]{1,60}):\s+(?P<rest>\S.*)$")
 
 
@@ -809,14 +805,14 @@ def _section_key(text: str) -> str:
 
 
 # Названия разделов, приведённые к виду «только буквы, строчные, без ё»: по ним
-# заголовок раздела узнаётся в ответе claude, как бы он его ни разметил.
+# заголовок раздела узнаётся в ответе ollama, как бы он его ни разметил.
 SECTION_KEYS = {_section_key(section.name): section.key for section in SECTIONS}
 
-# Так claude говорит «перечислять нечего»: такая строка не идёт в список как
+# Так ollama говорит «перечислять нечего»: такая строка не идёт в список как
 # пункт, вместо неё раздел получает единственную строку NOTHING.
 NOTHING_KEYS = {"непрозвучало", "ничего", "ничегонепрозвучало", "нет", "небыло"}
 
-# Так claude говорит «срок не назван»: любая из этих формулировок приводится к
+# Так ollama говорит «срок не назван»: любая из этих формулировок приводится к
 # одной — DEADLINE_UNKNOWN, чтобы строки заданий читались одинаково.
 UNKNOWN_DEADLINE_KEYS = {
     "неназван",
@@ -839,7 +835,7 @@ def section_of(line: str) -> str | None:
     """Это строка-заголовок одного из восьми разделов? Тогда какого.
 
     Заголовок распознаётся в трёх видах: markdown-заголовком любого уровня,
-    жирной строкой и просто строкой с названием раздела. Разметку claude
+    жирной строкой и просто строкой с названием раздела. Разметку ollama
     выбирает сам, а разделы должны найтись и в том случае, если он поставил
     «## Темы» или «**Темы**» вместо «### Темы».
     """
@@ -866,7 +862,7 @@ def demote_heading(line: str, minimum: int = INNER_HEADING_LEVEL) -> str:
     Зачем это нужно. Фрагмент вставляется в документ под готовый «## Саммари»,
     поэтому «#» и «##» внутри него разорвали бы документ на части. А уровень
     «###» занят восьмью разделами самого фрагмента: заголовок, пришедший из ответа
-    claude, обязан стоять ниже них, иначе читатель (и сборщик документа) не
+    ollama, обязан стоять ниже них, иначе читатель (и сборщик документа) не
     отличит его от начала раздела. Текст заголовка при этом не меняется —
     меняется только число решёток.
     """
@@ -945,7 +941,7 @@ def _overview_paragraphs(lines: list[str]) -> list[str]:
 
     Перенос строк внутри абзаца снимается: слова не меняются, но абзац в файле
     становится одной строкой — так его проще и читать, и разбирать построчно.
-    Заголовок, если claude его внутрь раздела всё же поставил, опускается ниже
+    Заголовок, если ollama его внутрь раздела всё же поставил, опускается ниже
     «###»: этот уровень занят восемью разделами самого фрагмента.
     """
     paragraphs: list[str] = []
@@ -967,7 +963,7 @@ def _squeeze(text: str) -> str:
 def homework_body(body: str) -> str | None:
     """Текст пункта ДЗ -> «задание — срок: <как сказано>». None — задания нет.
 
-    Срок берётся из самой строки claude: он уже обязан стоять там по промпту, но
+    Срок берётся из самой строки ollama: он уже обязан стоять там по промпту, но
     отделён может быть чем угодно — тире, запятой, двоеточием. Текст срока при
     этом не переписывается (кроме формулировок вида «не указан» — они приводятся
     к одной), а отсутствующий становится «срок: не назван»: в этой позиции
@@ -1015,7 +1011,7 @@ def _list_items(lines: list[str], record: Record, section: Section) -> list[str]
     говорящего — но только когда ярлыки вообще есть. Строка без ярлыка всё
     равно попадает во фрагмент: подписать её самому значит угадать, кто это
     сказал, а потерять — выбросить из саммари задание или договорённость.
-    Поэтому несделанное claude считается и называется в stderr.
+    Поэтому несделанное ollama считается и называется в stderr.
     """
     items: list[str] = []
     dropped = 0
@@ -1028,7 +1024,7 @@ def _list_items(lines: list[str], record: Record, section: Section) -> list[str]
         if not text:
             continue
         if _section_key(text) in NOTHING_KEYS:
-            # Claude сказал, что перечислять нечего: ниже это станет NOTHING.
+            # Ollama сказал, что перечислять нечего: ниже это станет NOTHING.
             continue
         found = parse_timecode(text)
         if found is None:
@@ -1057,7 +1053,7 @@ def _list_items(lines: list[str], record: Record, section: Section) -> list[str]
         )
     if unlabelled:
         warn(
-            "%s: в %d строках claude не поставил ярлык говорящего — строки "
+            "%s: в %d строках модель не поставила ярлык говорящего — строки "
             "оставлены как есть" % (section.name, unlabelled)
         )
     return items
@@ -1069,7 +1065,7 @@ def _check_deadlines_repeated(homework: list[str], deadlines: list[str]) -> None
     Этого требует промпт, но проверить его исполнение можно только здесь.
     Переносить срок в раздел сроков самостоятельно инструмент не станет: строка
     там — это «что сделать к сроку», а составить её из строки задания — значит
-    написать за claude текст, которого в ответе не было. Поэтому только stderr.
+    написать за ollama текст, которого в ответе не было. Поэтому только stderr.
     """
     said = " ".join(_section_key(line) for line in deadlines)
     lost: list[str] = []
@@ -1095,7 +1091,7 @@ def _check_deadlines_repeated(homework: list[str], deadlines: list[str]) -> None
 
 
 def parse_answer(answer: str, record: Record) -> Summary:
-    """Разбирает ответ claude на восемь разделов.
+    """Разбирает ответ ollama на восемь разделов.
 
     Нашлись не все восемь заголовков — ответ уходит в «Изложение» как есть, а
     Summary.parsed становится ложью: вызывающий по этому печатает предупреждение
@@ -1117,7 +1113,7 @@ def parse_answer(answer: str, record: Record) -> Summary:
             continue
         buckets[current].append(line)
 
-    # Считаются именно заголовки, а не их наполнение: раздел, который claude
+    # Считаются именно заголовки, а не их наполнение: раздел, который ollama
     # объявил и оставил пустым, — это всё-таки найденный раздел, и ниже он
     # получит пометку «не прозвучало», а не утянет весь ответ в «Изложение».
     if len(seen) < len(SECTIONS):
@@ -1131,7 +1127,7 @@ def parse_answer(answer: str, record: Record) -> Summary:
         )
 
     if preamble:
-        warn("в ответе claude было %d строк до первого раздела — они отброшены" % preamble)
+        warn("в ответе модели было %d строк до первого раздела — они отброшены" % preamble)
 
     overview = _overview_paragraphs(buckets[OVERVIEW])
     lists: dict[str, list[str]] = {}
@@ -1142,17 +1138,17 @@ def parse_answer(answer: str, record: Record) -> Summary:
                 # Запись без тем — это не «в ней их не было», а негодный ответ:
                 # про остальные разделы такого не скажешь, поэтому предупреждение
                 # только здесь.
-                warn("раздел «%s» в ответе claude пуст" % section.name)
+                warn("раздел «%s» в ответе модели пуст" % section.name)
             items = [NOTHING]
         lists[section.key] = items
     _check_deadlines_repeated(lists[HOMEWORK], lists[DEADLINES])
 
     if not overview:
-        warn("раздел «Изложение» в ответе claude пуст")
-        overview = ["Изложение не получено: claude оставил раздел пустым."]
+        warn("раздел «Изложение» в ответе модели пуст")
+        overview = ["Изложение не получено: модель оставила раздел пустым."]
     elif not OVERVIEW_MIN_PARAGRAPHS <= len(overview) <= OVERVIEW_MAX_PARAGRAPHS:
         warn(
-            "в изложении %d абзацев вместо %d–%d — текст claude оставлен как есть"
+            "в изложении %d абзацев вместо %d–%d — текст модели оставлен как есть"
             % (len(overview), OVERVIEW_MIN_PARAGRAPHS, OVERVIEW_MAX_PARAGRAPHS)
         )
 
@@ -1251,6 +1247,7 @@ _FLAGS_VALUE = {
     "--timeout": "timeout",
     "--attempts": "attempts",
     "--log-dir": "log_dir",
+    "--ollama-model": "ollama_model",
 }
 
 
@@ -1266,9 +1263,10 @@ def parse_args(argv: list[str]) -> dict:
         "speakers": None,
         "roles": None,
         "out": None,
-        "timeout": claude_cli.DEFAULT_TIMEOUT,
-        "attempts": claude_cli.DEFAULT_ATTEMPTS,
+        "timeout": ollama_client.DEFAULT_TIMEOUT,
+        "attempts": ollama_client.DEFAULT_ATTEMPTS,
         "log_dir": None,
+        "ollama_model": ollama_client.DEFAULT_MODEL,
         "help": False,
         "selftest": False,
     }
@@ -1363,21 +1361,190 @@ def check_args(opts: dict) -> tuple[str, str]:
 
 
 def make_summary(record: Record, opts: dict) -> Summary:
-    """Один вызов claude и разбор ответа. Неудача — это Summary с пометкой."""
-    prompt = build_prompt(record)
+    """Локальное саммари; неудача не уничтожает расшифровку."""
     try:
-        answer = claude_cli.ask(
-            prompt,
-            timeout=opts["timeout"],
-            attempts=opts["attempts"],
-            log_dir=opts["log_dir"],
-            tag=LOG_TAG,
+        ollama_client.probe(opts["ollama_model"])
+        if os.environ.get("OLLAMA_TEST_BIN") is not None:
+            return parse_answer(ollama_client.ask(
+                build_prompt(record), model=opts["ollama_model"],
+                timeout=opts["timeout"], attempts=opts["attempts"],
+                log_dir=opts["log_dir"], tag=LOG_TAG,
+            ), record)
+        return make_local_summary(record, opts)
+    except (ollama_client.OllamaError, OSError) as exc:
+        return missing_summary("локальная модель не ответила: %s" % exc)
+
+
+# На реальном qwen3:8b окно в 10 000 символов дало ответ длиннее 3072 токенов.
+# Более короткие части избегают дорогого повторного прогона после обрезания.
+LOCAL_CHUNK_CHARS = 6000
+LOCAL_REDUCE_CHARS = 8000
+
+
+def _split_long_line(line: Line) -> list[Line]:
+    """Keep every word and its original timecode, including long utterances."""
+    if len(render_line(line)) <= LOCAL_CHUNK_CHARS:
+        return [line]
+    result: list[Line] = []
+    rest = line.text
+    while rest:
+        room = LOCAL_CHUNK_CHARS - len(render_line(replace(line, text=""))) - 1
+        if len(rest) <= room:
+            result.append(replace(line, text=rest))
+            break
+        cut = rest.rfind(" ", 1, room + 1)
+        if cut < 1:
+            cut = room
+        result.append(replace(line, text=rest[:cut].strip()))
+        rest = rest[cut:].lstrip()
+    return result
+
+
+def _local_chunks(record: Record) -> list[Record]:
+    chunks: list[Record] = []
+    current: list[Line] = []
+    size = 0
+    for original in record.lines:
+        for line in _split_long_line(original):
+            length = len(render_line(line)) + 1
+            if current and size + length > LOCAL_CHUNK_CHARS:
+                chunks.append(replace(record, lines=current))
+                current, size = [], 0
+            current.append(line)
+            size += length
+    if current:
+        chunks.append(replace(record, lines=current))
+    return chunks
+
+
+def _strict_local_answer(answer: str, record: Record) -> Summary:
+    """Reject malformed sections and timestamps not present in this input."""
+    section = None
+    allowed = {format_timecode(line.start) for line in record.lines}
+    for raw in answer.splitlines():
+        found = section_of(raw)
+        if found is not None:
+            section = found
+            continue
+        text = raw.strip()
+        if not text or section is None or section == OVERVIEW:
+            continue
+        if _section_key(text) in NOTHING_KEYS:
+            continue
+        timestamp = parse_timecode(text)
+        if timestamp is None or format_timecode(timestamp[0]) not in allowed:
+            raise ollama_client.OllamaError("ответ содержит пункт без исходного таймкода: %s" % text[:100])
+    parsed = parse_answer(answer, record)
+    if not parsed.parsed:
+        raise ollama_client.OllamaError("модель не вернула восемь разделов")
+    return parsed
+
+
+def _local_chunk_summary(record: Record, opts: dict, number: int) -> Summary:
+    prompt = (
+        "Это часть длинной записи. Сделай саммари только приведённой части, "
+        "сохраняя таймкоды её строк.\n\n" + build_prompt(record)
+    )
+    try:
+        answer = ollama_client.ask(
+            prompt, model=opts["ollama_model"], timeout=opts["timeout"],
+            attempts=opts["attempts"], log_dir=opts["log_dir"],
+            tag="саммари-часть-%03d" % number,
         )
-    except claude_cli.ClaudeUnavailable as exc:
-        return missing_summary("вызывать claude нечем: %s" % exc)
-    except claude_cli.ClaudeFailed as exc:
-        return missing_summary("claude не ответил: %s" % exc)
-    return parse_answer(answer, record)
+    except ollama_client.OllamaError as exc:
+        if "контекст" in str(exc) or "обрезан" in str(exc):
+            if len(record.lines) > 1:
+                middle = len(record.lines) // 2
+                left_lines, right_lines = record.lines[:middle], record.lines[middle:]
+            elif len(record.lines[0].text) > 2:
+                line = record.lines[0]
+                middle = len(line.text) // 2
+                left_lines = [replace(line, text=line.text[:middle])]
+                right_lines = [replace(line, text=line.text[middle:])]
+            else:
+                raise
+            left = _local_chunk_summary(replace(record, lines=left_lines), opts, number)
+            right = _local_chunk_summary(replace(record, lines=right_lines), opts, number)
+            return _merge_local([left, right], opts)
+        raise
+    try:
+        return _strict_local_answer(answer, record)
+    except ollama_client.OllamaError:
+        answer = ollama_client.ask(
+            prompt + "\nПовтори ответ строго в восьми разделах; каждый пункт списка снабди таймкодом из текста.\n",
+            model=opts["ollama_model"], timeout=opts["timeout"], attempts=1,
+            log_dir=opts["log_dir"], tag="саммари-повтор-%03d" % number,
+        )
+        return _strict_local_answer(answer, record)
+
+
+def _overview_reduce(text: str, opts: dict, number: int) -> str:
+    prompt = (
+        "Объедини изложение частей одной записи в связное изложение по-русски "
+        "из 3–8 абзацев. Сохрани важные связи между частями. Опирайся только "
+        "на приведённые сведения, ничего не додумывай. Верни только абзацы, "
+        "без заголовков и списков.\n\n" + text
+    )
+    answer = ""
+    for retry in range(2):
+        answer = ollama_client.ask(
+            prompt + ("\nСтрого 3–8 абзацев, без заголовков.\n" if retry else ""),
+            model=opts["ollama_model"], timeout=opts["timeout"],
+            attempts=opts["attempts"], log_dir=opts["log_dir"],
+            tag="саммари-сводка-%03d" % number,
+        )
+        paragraphs = _overview_paragraphs(answer.splitlines())
+        if (OVERVIEW_MIN_PARAGRAPHS <= len(paragraphs) <= OVERVIEW_MAX_PARAGRAPHS
+                and not any(line.lstrip().startswith(("#", "- ", "* "))
+                            for line in answer.splitlines())):
+            return answer
+    warn("сводка изложения не содержит 3–8 обычных абзацев — текст модели оставлен как есть")
+    return answer
+
+
+def _merge_local(parts: list[Summary], opts: dict) -> Summary:
+    """Merge factual lists mechanically; only prose is synthesized again."""
+    overview = "\n\n".join("\n\n".join(part.overview) for part in parts)
+    round_number = 1
+    while len(overview) > LOCAL_REDUCE_CHARS:
+        paragraphs = overview.split("\n\n")
+        groups: list[str] = []
+        group = ""
+        for paragraph in paragraphs:
+            if group and len(group) + len(paragraph) + 2 > LOCAL_REDUCE_CHARS:
+                groups.append(group)
+                group = ""
+            group += ("\n\n" if group else "") + paragraph
+        if group:
+            groups.append(group)
+        reduced = [_overview_reduce(group, opts, round_number * 100 + i) for i, group in enumerate(groups)]
+        overview = "\n\n".join(reduced)
+        round_number += 1
+        if round_number > 10:
+            raise ollama_client.OllamaError("не удалось сократить изложение до размера контекста")
+    overview = _overview_reduce(overview, opts, round_number)
+    lists: dict[str, list[str]] = {}
+    for key in LIST_KEYS:
+        seen: set[str] = set()
+        items: list[str] = []
+        for part in parts:
+            for item in part.items(key):
+                if item == NOTHING or item in seen:
+                    continue
+                seen.add(item)
+                items.append(item)
+        items.sort(key=lambda item: parse_timecode(item)[0])
+        lists[key] = items or [NOTHING]
+    return Summary(overview=_overview_paragraphs(overview.splitlines()), lists=lists, parsed=True)
+
+
+def make_local_summary(record: Record, opts: dict) -> Summary:
+    chunks = _local_chunks(record)
+    parts = []
+    for number, chunk in enumerate(chunks, 1):
+        print("%s: Ollama — часть %d из %d" % (PROG, number, len(chunks)), file=sys.stderr)
+        parts.append(_local_chunk_summary(chunk, opts, number))
+    return parts[0] if len(parts) == 1 else _merge_local(parts, opts)
 
 
 def main(argv: list[str]) -> int:
@@ -1422,7 +1589,7 @@ def main(argv: list[str]) -> int:
         return 1
     if not summary.parsed:
         warn(
-            "восемь разделов в ответе claude не найдены — ответ сохранён как есть под "
+            "восемь разделов в ответе ollama не найдены — ответ сохранён как есть под "
             "«%s»" % SECTION_OVERVIEW
         )
     return 0
@@ -1430,8 +1597,8 @@ def main(argv: list[str]) -> int:
 
 # ---------------------------------------------------------------- селф-тест ---
 #
-# Установленный claude здесь не нужен и намеренно не используется: все вызовы
-# идут на подставных sh-скриптах, путь к которым подсовывается через CLAUDE_BIN.
+# Установленный ollama здесь не нужен и намеренно не используется: все вызовы
+# идут на подставных sh-скриптах, путь к которым подсовывается через OLLAMA_TEST_BIN.
 # Каждая заглушка лежит в своём каталоге и пишет рядом с собой, сколько раз её
 # позвали и с какими аргументами, — так проверяется и число вызовов, и промпт.
 
@@ -1467,10 +1634,10 @@ def _check(condition: object, message: str) -> None:
 
 
 def _stub(root: str, name: str, body: str) -> str:
-    """Создаёт каталог с исполняемой заглушкой `claude` внутри."""
+    """Создаёт каталог с исполняемой заглушкой `ollama` внутри."""
     directory = os.path.join(root, name)
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, "claude")
+    path = os.path.join(directory, "ollama")
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(STUB_PREAMBLE + body)
     os.chmod(path, 0o755)
@@ -1509,10 +1676,10 @@ def _prompt_of(stub: str) -> str:
 
 
 def _run(argv: list[str], binary: str | None = None) -> tuple[int, str, str]:
-    """Сквозной прогон main() с перехватом вывода и подменой CLAUDE_BIN."""
-    saved = os.environ.get("CLAUDE_BIN")
+    """Сквозной прогон main() с перехватом вывода и подменой OLLAMA_TEST_BIN."""
+    saved = os.environ.get("OLLAMA_TEST_BIN")
     if binary is not None:
-        os.environ["CLAUDE_BIN"] = binary
+        os.environ["OLLAMA_TEST_BIN"] = binary
     stdout, stderr = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -1520,9 +1687,9 @@ def _run(argv: list[str], binary: str | None = None) -> tuple[int, str, str]:
     finally:
         if binary is not None:
             if saved is None:
-                os.environ.pop("CLAUDE_BIN", None)
+                os.environ.pop("OLLAMA_TEST_BIN", None)
             else:
-                os.environ["CLAUDE_BIN"] = saved
+                os.environ["OLLAMA_TEST_BIN"] = saved
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -1538,7 +1705,7 @@ def _write_json(path: str, payload: object) -> str:
 
 
 def _fixture_punctuated() -> dict:
-    """Файл схемы punctuated/1 для проверок: собирается в памяти, без claude.
+    """Файл схемы punctuated/1 для проверок: собирается в памяти, без ollama.
 
     Последнее предложение начинается на 9329-й секунде — это 02:35:29, случай
     «два с половиной часа» из критериев приёмки.
@@ -1656,10 +1823,10 @@ def _fixture_roles() -> dict:
         "status": "ok",
         "reason": "",
         "roles": [
-            {"speaker": "Говорящий 1", "role": "Преподаватель", "share": 0.7, "source": "claude"},
-            {"speaker": "Говорящий 2", "role": "Студент 1", "share": 0.3, "source": "claude"},
+            {"speaker": "Говорящий 1", "role": "Преподаватель", "share": 0.7, "source": "ollama"},
+            {"speaker": "Говорящий 2", "role": "Студент 1", "share": 0.3, "source": "ollama"},
         ],
-        "stats": {"speakers": 2, "from_claude": 2, "defaulted": 0},
+        "stats": {"speakers": 2, "from_ollama": 2, "defaulted": 0},
     }
 
 
@@ -1737,7 +1904,7 @@ _OVERVIEW_DEFAULT = "Первый абзац.\n\nВторой абзац.\n\nТ�
 
 
 def _answer(**bodies: str) -> str:
-    """Собирает ответ claude из восьми разделов в правильном порядке.
+    """Собирает ответ ollama из восьми разделов в правильном порядке.
 
     Чего не передали — у списочного раздела «не прозвучало», у «Изложения» три
     коротких абзаца. Так фикстура в каждой проверке занимает ровно те разделы, о
@@ -1755,11 +1922,11 @@ def _answer(**bodies: str) -> str:
 
 
 def _good_answer() -> str:
-    """Ответ claude, какого требует промпт: восемь разделов и таймкоды из строк.
+    """Ответ ollama, какого требует промпт: восемь разделов и таймкоды из строк.
 
     Срок первого домашнего задания назван и повторён строкой в «Сроках и
     дедлайнах» — как того требует промпт; у второго задания срока в записи нет,
-    и claude про него ничего не написал.
+    и ollama про него ничего не написал.
     """
     return _answer(
         overview=(
@@ -1853,7 +2020,7 @@ def _test_section_order() -> None:
 
 
 def _test_timecodes() -> None:
-    """Формат таймкода во фрагменте и разбор таймкодов из ответа claude."""
+    """Формат таймкода во фрагменте и разбор таймкодов из ответа ollama."""
     _check(format_timecode(9329.4) == "02:35:29", "02:35:29 не отрендерился")
     _check(format_timecode(0.0) == "00:00:00", "ноль не отрендерился")
     _check(format_timecode(3723.9) == "01:02:03", "01:02:03 не отрендерился")
@@ -1910,7 +2077,7 @@ def _test_sections() -> None:
 
 
 def _test_good_answer() -> None:
-    """Успешный ответ: восемь разделов, один вызов claude, промпт со строками."""
+    """Успешный ответ: восемь разделов, один вызов ollama, промпт со строками."""
     with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "punctuated.json"), _fixture_punctuated())
         stub = _answering_stub(workdir, "ок", _good_answer())
@@ -1920,7 +2087,7 @@ def _test_good_answer() -> None:
         code, report, stderr = _run(["--punctuated", source, "--out", out], stub)
         _check(code == 0, "успешный ответ вернул код %d (stderr: %s)" % (code, stderr.strip()))
         _check(os.path.isfile(out), "фрагмент не записан: %s" % out)
-        _check(_calls(stub) == 1, "claude позван %d раз, а должен ровно один" % _calls(stub))
+        _check(_calls(stub) == 1, "ollama позван %d раз, а должен ровно один" % _calls(stub))
 
         fragment = parse_fragment(_read(out))
         _check(len(fragment["overview"]) == 3, "абзацев %d" % len(fragment["overview"]))
@@ -2108,7 +2275,7 @@ def _test_untidy_answer() -> None:
         _check("абзацев" in stderr, "про число абзацев не предупредили: %s" % stderr)
 
         # Таймкод за концом записи — признак выдуманного: строка остаётся (слов
-        # claude инструмент не трогает), но о ней сказано в stderr.
+        # ollama инструмент не трогает), но о ней сказано в stderr.
         beyond = _answering_stub(
             workdir, "мимо", _answer(topics="- [05:00:00] Тема из будущего")
         )
@@ -2160,7 +2327,7 @@ def _test_no_sections() -> None:
                 fragment[key] == [NOT_PARSED],
                 "раздел %s не помечен: %r" % (key, fragment[key]),
             )
-        _check("восемь разделов в ответе claude не найдены" in stderr,
+        _check("восемь разделов в ответе ollama не найдены" in stderr,
                "нет предупреждения о ненайденных разделах: %s" % stderr)
         _check("восемь разделов в ответе не найдены" in report, "в отчёте нет пометки: %s" % report)
 
@@ -2183,7 +2350,7 @@ def _test_no_sections() -> None:
                 "без раздела %s списки не помечены: %r" % (skipped.key, fragment["topics"]),
             )
             _check(
-                "восемь разделов в ответе claude не найдены" in stderr,
+                "восемь разделов в ответе ollama не найдены" in stderr,
                 "без раздела %s нет предупреждения: %s" % (skipped.key, stderr),
             )
 
@@ -2191,7 +2358,7 @@ def _test_no_sections() -> None:
 def _test_nothing_said() -> None:
     """Пустой список в любом из семи разделов — ровно строка «не прозвучало».
 
-    Проверяется на всех семи по очереди и во всех трёх видах, какими claude
+    Проверяется на всех семи по очереди и во всех трёх видах, какими ollama
     говорит «перечислять нечего»: домашних заданий, сроков, терминов и
     материалов в обычном созвоне и правда не бывает, так что это не редкий
     случай, а повседневный.
@@ -2199,10 +2366,10 @@ def _test_nothing_said() -> None:
     with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
         empty_bodies = [
-            ("claude сказал словами", NOTHING),
-            ("claude сказал без маркера", "не прозвучало"),
-            ("claude оставил раздел пустым", ""),
-            ("claude ответил «нет»", "нет"),
+            ("ollama сказал словами", NOTHING),
+            ("ollama сказал без маркера", "не прозвучало"),
+            ("ollama оставил раздел пустым", ""),
+            ("ollama ответил «нет»", "нет"),
         ]
         for number, section in enumerate(LIST_SECTIONS):
             for order, (name, body) in enumerate(empty_bodies):
@@ -2240,7 +2407,7 @@ def _test_not_received() -> None:
              ["--attempts", "1"], "код 3"),
             ("не авторизован", _stub(workdir, "логин", "printf 'Invalid API key\\n' >&2\nexit 1\n"),
              ["--attempts", "1"], "не авторизован"),
-            ("нет бинарника", os.path.join(workdir, "нет такого", "claude"), [], "файл не найден"),
+            ("нет бинарника", os.path.join(workdir, "нет такого", "ollama"), [], "файл не найден"),
             ("таймаут", _stub(workdir, "спит", "sleep 30\n"),
              ["--attempts", "1", "--timeout", "0.4"], "таймаут"),
         ]
@@ -2269,17 +2436,17 @@ def _test_not_received() -> None:
             _check(note in stderr, "случай %r: причины нет в stderr: %s" % (name, stderr))
             _check("не получено" in report, "случай %r: в отчёте нет пометки" % name)
 
-        # Слишком длинный промпт — тот же исход, причём claude не вызывается.
+        # Слишком длинный промпт — тот же исход, причём ollama не вызывается.
         stub = _answering_stub(workdir, "длинный", _good_answer())
-        saved = claude_cli.MAX_PROMPT_BYTES
-        claude_cli.MAX_PROMPT_BYTES = 100
+        saved = ollama_client.MAX_PROMPT_BYTES
+        ollama_client.MAX_PROMPT_BYTES = 100
         try:
             out = os.path.join(workdir, "длинный.md")
             code, _, stderr = _run(["--punctuated", source, "--out", out], stub)
         finally:
-            claude_cli.MAX_PROMPT_BYTES = saved
+            ollama_client.MAX_PROMPT_BYTES = saved
         _check(code == 1, "длинный промпт вернул код %d" % code)
-        _check(_calls(stub) == 0, "длинный промпт всё-таки ушёл в claude")
+        _check(_calls(stub) == 0, "длинный промпт всё-таки ушёл в ollama")
         note = parse_fragment(_read(out))["overview"][0]
         _check("слишком длинный" in note, "в пометке нет причины про длину: %r" % note)
 
@@ -2376,7 +2543,7 @@ def _test_transcript_mode() -> None:
 
 
 def _labelled_answer() -> str:
-    """Ответ claude, какого требует промпт с ярлыками: они ровно в двух разделах."""
+    """Ответ ollama, какого требует промпт с ярлыками: они ровно в двух разделах."""
     return _answer(
         homework=(
             "- [00:00:00] Преподаватель: Прочитать главу про нарезку текста — "
@@ -2404,7 +2571,7 @@ def _test_speaker_labels() -> None:
         argv = ["--punctuated", source, "--speakers", speakers, "--roles", roles, "--out", out]
         code, report, stderr = _run(argv, stub)
         _check(code == 0, "прогон с ярлыками вернул код %d (stderr: %s)" % (code, stderr.strip()))
-        _check(_calls(stub) == 1, "claude позван %d раз, а должен ровно один" % _calls(stub))
+        _check(_calls(stub) == 1, "ollama позван %d раз, а должен ровно один" % _calls(stub))
         _check(not stderr.strip(), "при годных speakers и roles есть stderr: %s" % stderr.strip())
 
         # Тело промпта — фразы с ярлыками, а не предложения: у фразы без
@@ -2506,7 +2673,7 @@ def _test_speaker_labels() -> None:
 
 
 def _test_labels_missing() -> None:
-    """Claude не поставил ярлык: строки остаются, в stderr — число таких строк."""
+    """Ollama не поставил ярлык: строки остаются, в stderr — число таких строк."""
     with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
         speakers = _write_json(os.path.join(workdir, "speakers.json"), _fixture_speakers())
@@ -2524,11 +2691,11 @@ def _test_labels_missing() -> None:
         _check(report_row("Домашних заданий", "2") in report, "в отчёте не те цифры:\n%s" % report)
         for name in ("Домашние задания", "Решения, задачи, договорённости"):
             _check(
-                "%s: в 2 строках claude не поставил ярлык" % name in stderr,
+                "%s: в 2 строках модель не поставила ярлык" % name in stderr,
                 "про строки без ярлыка в «%s» не предупредили: %s" % (name, stderr),
             )
         # Про шесть остальных разделов такого предупреждения нет.
-        _check(stderr.count("не поставил ярлык") == 2,
+        _check(stderr.count("не поставила ярлык") == 2,
                "предупреждение ушло не в те разделы: %s" % stderr)
 
         # Ярлык в одной строке из двух — предупреждение про одну.
@@ -2549,7 +2716,7 @@ def _test_labels_missing() -> None:
         )
         _check(code == 0, "половина ярлыков вернула код %d" % code)
         _check(
-            "Решения, задачи, договорённости: в 1 строках claude не поставил ярлык" in stderr,
+            "Решения, задачи, договорённости: в 1 строках модель не поставила ярлык" in stderr,
             "не то число строк без ярлыка: %s" % stderr,
         )
         _check(
@@ -2570,7 +2737,7 @@ def _test_labels_missing() -> None:
             stranger,
         )
         _check(code == 0, "чужой ярлык вернул код %d" % code)
-        _check("не поставил ярлык" in stderr, "про чужой ярлык не предупредили: %s" % stderr)
+        _check("не поставила ярлык" in stderr, "про чужой ярлык не предупредили: %s" % stderr)
         _check(
             parse_fragment(_read(out3))["actions"]
             == ["- [00:10:00] Студент 7: Так и не договорились"],
@@ -2662,7 +2829,7 @@ def _test_speakers_degraded() -> None:
             dict(
                 _fixture_roles(),
                 roles=[{"speaker": "Говорящий 9", "role": "Гость", "share": 1.0,
-                        "source": "claude"}],
+                        "source": "ollama"}],
             ),
         )
         stub = _answering_stub(workdir, "чужие-роли", _good_answer())
@@ -2791,7 +2958,7 @@ def _test_broken_input() -> None:
             _check(code == 2, "случай %r завершился кодом %d, ожидался 2" % (what, code))
             _check(stderr.startswith(PROG + ":"), "случай %r ничего не сказал в stderr" % what)
             _check(not os.path.exists(out), "случай %r оставил файл --out на диске" % what)
-        _check(_calls(stub) == 0, "при непригодном входе claude всё-таки вызывался")
+        _check(_calls(stub) == 0, "при непригодном входе ollama всё-таки вызывался")
 
         # Существующий фрагмент при непригодном входе не перетирается.
         kept = os.path.join(workdir, "kept.md")
@@ -2802,12 +2969,12 @@ def _test_broken_input() -> None:
 
 
 def _test_log_dir() -> None:
-    """--log-dir: промпт и ответ сохраняются через tools/claude_cli.py."""
+    """--log-dir: промпт и ответ сохраняются через tools/ollama_client.py."""
     with tempfile.TemporaryDirectory(prefix="summarize-selftest-") as workdir:
         source = _write_json(os.path.join(workdir, "p.json"), _fixture_punctuated())
         stub = _answering_stub(workdir, "ок", _good_answer())
         out = os.path.join(workdir, "саммари.md")
-        log_dir = os.path.join(workdir, "логи claude")
+        log_dir = os.path.join(workdir, "логи ollama")
 
         code, _, _ = _run(
             ["--punctuated", source, "--out", out, "--log-dir", log_dir], stub
@@ -2821,7 +2988,7 @@ def _test_log_dir() -> None:
         prompt_log = _read(os.path.join(log_dir, "%s-001.prompt.txt" % LOG_TAG))
         _check("[02:35:29] На этом закончили" in prompt_log, "в логе промпта нет строк записи")
         response_log = _read(os.path.join(log_dir, "%s-001.response.txt" % LOG_TAG))
-        _check(SECTION_TOPICS in response_log, "в логе ответа нет ответа claude")
+        _check(SECTION_TOPICS in response_log, "в логе ответа нет ответа ollama")
 
         # Неудачный вызов тоже оставляет оба файла — иначе непонятно, что ушло.
         broken = _stub(workdir, "упал", "exit 5\n")
@@ -2845,6 +3012,7 @@ def _test_help() -> None:
             "--speakers",
             "--roles",
             "--out",
+            "--ollama-model",
             "--timeout",
             "--attempts",
             "--log-dir",
@@ -2890,7 +3058,8 @@ def _test_only_stdlib() -> None:
         "tempfile",
         "contextlib",
         "dataclasses",
-        "claude_cli",
+        "ollama_client",
+        "ollama_client",
         "render_doc",
     }
     with open(os.path.abspath(__file__), "r", encoding="utf-8") as handle:
@@ -2898,8 +3067,130 @@ def _test_only_stdlib() -> None:
     imported = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w]*)", source, re.MULTILINE))
     _check(imported, "импортов не нашлось — проверка сломана")
     _check(imported <= allowed, "лишние импорты: %r" % sorted(imported - allowed))
-    # Свой subprocess здесь не пишется: claude запускается только через обёртку.
+    # Свой subprocess здесь не пишется: ollama запускается только через обёртку.
     _check("subprocess" not in imported, "появился свой вызов subprocess")
+
+
+def _test_local_summary() -> None:
+    """Long input is covered by chunks; lists keep original timecodes."""
+    lines = [Line(start=float(i * 60), text=("фраза %d " % i) * 125) for i in range(20)]
+    record = Record(path="пример", schema=PUNCTUATED_SCHEMA, source="лекция", duration=1200, lines=lines)
+    chunks = _local_chunks(record)
+    _check(len(chunks) > 1, "длинная запись не разбита")
+    _check([line for chunk in chunks for line in chunk.lines] == lines, "часть строк потеряна")
+    original = ollama_client._request
+    calls: list[str] = []
+
+    def fake(path: str, payload: dict | None, timeout: float) -> dict:
+        if path == "/api/tags":
+            return {"models": [{"name": "qwen3:8b"}]}
+        _check(path == "/api/chat" and payload is not None, "не тот маршрут Ollama")
+        _check(payload["stream"] is False and payload["think"] is False, "не те опции Ollama")
+        prompt = payload["messages"][0]["content"]
+        calls.append(prompt)
+        if prompt.startswith("Объедини изложение"):
+            answer = "Первый абзац.\n\nВторой абзац.\n\nТретий абзац."
+        else:
+            found = re.search(r"\[(\d\d:\d\d:\d\d)\] фраза", prompt)
+            _check(found is not None, "в части нет исходных строк")
+            stamp = found.group(1)
+            blocks = [SECTION_OVERVIEW + "\nПервый абзац.\n\nВторой абзац.\n\nТретий абзац."]
+            for section in LIST_SECTIONS:
+                item = "- [%s] важный факт" % stamp if section.key in ("key_points", TOPICS) else NOTHING
+                blocks.append(section.heading + "\n" + item)
+            answer = "\n\n".join(blocks)
+        return {"message": {"content": answer}, "prompt_eval_count": 1000,
+                "eval_count": 100, "done_reason": "stop"}
+
+    ollama_client._request = fake
+    try:
+        result = make_summary(record, {"provider": "ollama", "ollama_model": "qwen3:8b",
+                                       "timeout": 10, "attempts": 1, "log_dir": None})
+    finally:
+        ollama_client._request = original
+    _check(result.received and result.parsed, "локальное саммари не получено")
+    _check(len(result.items("key_points")) == len(chunks), "пункты частей потеряны")
+    _check(len(calls) > len(chunks), "сводка изложения не вызвана")
+    bad = "\n\n".join([SECTION_OVERVIEW + "\nТекст."] +
+                      [section.heading + "\n- [09:59:59] факт" for section in LIST_SECTIONS])
+    try:
+        _strict_local_answer(bad, chunks[0])
+    except ollama_client.OllamaError:
+        pass
+    else:
+        raise AssertionError("выдуманный таймкод принят")
+
+
+def _test_local_unavailable() -> None:
+    original = ollama_client._request
+    def unavailable(path: str, payload: dict | None, timeout: float) -> dict:
+        raise ollama_client.OllamaError("сервер не запущен")
+    ollama_client._request = unavailable
+    try:
+        record = Record(path="пример", schema=PUNCTUATED_SCHEMA, source="лекция",
+                        duration=1, lines=[Line(start=0, text="текст")])
+        result = make_summary(record, {"provider": "ollama", "ollama_model": "qwen3:8b"})
+    finally:
+        ollama_client._request = original
+    _check(not result.received and "сервер не запущен" in result.missing,
+           "неполученное саммари не помечено")
+
+
+def _test_local_context_split() -> None:
+    """A context overflow retries smaller input without dropping a line."""
+    record = Record(path="пример", schema=PUNCTUATED_SCHEMA, source="лекция", duration=20,
+                    lines=[Line(start=0, text="первая фраза"), Line(start=10, text="вторая фраза")])
+    original = ollama_client.ask
+    calls = 0
+
+    def fake(prompt: str, **kwargs) -> str:
+        nonlocal calls
+        calls += 1
+        if prompt.startswith("Объедини изложение"):
+            return "Начало.\n\nПродолжение.\n\nИтог."
+        if "первая фраза" in prompt and "вторая фраза" in prompt:
+            raise ollama_client.OllamaError("контекст почти заполнен")
+        stamp = "00:00:00" if "первая фраза" in prompt else "00:00:10"
+        return "\n\n".join(
+            [SECTION_OVERVIEW + "\nНачало.\n\nПродолжение.\n\nИтог."] +
+            [section.heading + "\n" +
+             ("- [%s] факт" % stamp if section.key in ("key_points", TOPICS) else NOTHING)
+             for section in LIST_SECTIONS]
+        )
+
+    ollama_client.ask = fake
+    try:
+        summary = _local_chunk_summary(record, {"ollama_model": "qwen3:8b", "timeout": 1,
+                                                "attempts": 1, "log_dir": None}, 1)
+    finally:
+        ollama_client.ask = original
+    _check(summary.received and len(summary.items("key_points")) == 2,
+           "при переполнении потеряна часть записи")
+    _check(calls >= 4, "вход не был разбит и собран повторно")
+
+
+def _test_local_single_paragraph() -> None:
+    """A useful eight-section answer is kept when prose has one paragraph."""
+    record = Record(path="пример", schema=PUNCTUATED_SCHEMA, source="лекция", duration=1,
+                    lines=[Line(start=0, text="важный факт")])
+    answer = "\n\n".join(
+        [SECTION_OVERVIEW + "\nСвязное изложение одним абзацем."] +
+        [section.heading + "\n" +
+         ("- [00:00:00] важный факт" if section.key in ("key_points", TOPICS) else NOTHING)
+         for section in LIST_SECTIONS]
+    )
+    summary = _strict_local_answer(answer, record)
+    _check(summary.received and summary.parsed and len(summary.overview) == 1,
+           "саммари с одним абзацем ошибочно отброшено")
+    original = ollama_client.ask
+    ollama_client.ask = lambda *args, **kwargs: "Один абзац."
+    try:
+        reduced = _overview_reduce("Часть записи.", {"ollama_model": "qwen3:8b",
+                                                  "timeout": 1, "attempts": 1,
+                                                  "log_dir": None}, 1)
+    finally:
+        ollama_client.ask = original
+    _check(reduced == "Один абзац.", "сводка с одним абзацем ошибочно отброшена")
 
 
 def selftest() -> int:
@@ -2916,13 +3207,17 @@ def selftest() -> int:
         ("саммари не получено: пометка и код 1", _test_not_received),
         ("режим --transcript и приоритет --punctuated", _test_transcript_mode),
         ("ярлыки говорящих в промпте и двух разделах", _test_speaker_labels),
-        ("claude не поставил ярлык: строки на месте", _test_labels_missing),
+        ("ollama не поставил ярлык: строки на месте", _test_labels_missing),
         ("негодные speakers и roles: работа по старому пути", _test_speakers_degraded),
         ("без --speakers промпт и фрагмент прежние", _test_without_speakers),
         ("непригодный вход и коды возврата", _test_broken_input),
         ("--log-dir: промпт и ответ на диске", _test_log_dir),
         ("справка", _test_help),
         ("импорты только из стандартной библиотеки", _test_only_stdlib),
+        ("локальные части, сводка и таймкоды", _test_local_summary),
+        ("локальная модель недоступна", _test_local_unavailable),
+        ("переполнение контекста: разбиение без потерь", _test_local_context_split),
+        ("один абзац не отменяет локальное саммари", _test_local_single_paragraph),
     )
     failed = 0
     sys.stdout.write("================ СЕЛФ-ТЕСТ summarize.py ================\n")
